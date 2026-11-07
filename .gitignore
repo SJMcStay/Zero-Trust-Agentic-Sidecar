@@ -1,0 +1,129 @@
+# =====================================================================
+# Zero-Trust Agentic Sidecar — .gitignore
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock is COMMITTED (this is a binary, not a library).
+
+# Profiling / coverage / bench output
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data*
+/coverage/
+lcov.info
+tarpaulin-report.html
+/criterion/
+
+# ---------------------------------------------------------------------
+# Secrets & crypto material (sidecar does signing/verification)
+# NEVER commit real keys. Put test fixtures under tests/fixtures/ and
+# un-ignore explicitly if needed.
+# ---------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+*.der
+id_rsa*
+id_ed25519*
+secrets/
+/keys/
+!tests/fixtures/**
+
+# ---------------------------------------------------------------------
+# Jev / model artifacts (large binaries — use Git LFS or download script)
+# ---------------------------------------------------------------------
+/models/
+*.onnx
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Runtime logs / audit output (may contain captured prompts + payloads)
+*.log
+/logs/
+/audit/
+*.jsonl
+
+# ---------------------------------------------------------------------
+# Claude Code
+#   SHARED (commit):  CLAUDE.md, .claude/settings.json, .claude/agents/,
+#                     .claude/commands/, .claude/skills/, .mcp.json
+#   PERSONAL (ignore): below
+# ---------------------------------------------------------------------
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
+.claude/todos/
+.claude/shell-snapshots/
+.claude/statsig/
+.claude/*.local.*
+*.original.md
+
+# ---------------------------------------------------------------------
+# Google Antigravity / Gemini CLI
+#   SHARED (commit):  AGENTS.md, GEMINI.md, .agent/rules/,
+#                     .agent/workflows/, .gemini/settings.json
+#   PERSONAL (ignore): below
+# ---------------------------------------------------------------------
+.gemini/.env
+.gemini/tmp/
+.gemini/*.local.*
+.gemini/settings.local.json
+.agent/*.local.*
+.antigravity/
+.antigravity-server/
+
+# ---------------------------------------------------------------------
+# Other AI tooling (in case collaborators use them)
+# ---------------------------------------------------------------------
+.cursor/
+.aider*
+.codex/
+.continue/
+
+# ---------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.history/
+
+# ---------------------------------------------------------------------
+# OS
+# ---------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------
+# Scratch
+# ---------------------------------------------------------------------
+/tmp/
+/scratch/
+*.tmp
