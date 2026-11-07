@@ -76,17 +76,7 @@ constraints.body = { max_len = 2000 }
 
 ## Decisions
 
-| # | Choice | Reason | Rejected |
-| --- | --- | --- | --- |
-| D1 | Rust | memory safety, no GC pauses, single binary | Go, Python |
-| D2 | Plain HTTP JSON | smallest protocol, testable with `curl` | MCP, OpenAI proxy (later) |
-| D3 | Policy decides, model gives inputs | deterministic, auditable | model outputs allow/deny |
-| D4 | Own TOML policy engine | ~150 lines, fully understood | Cedar, OPA |
-| D5 | HMAC shared secret | proves origin + integrity + freshness, ~40 lines | mTLS, JWT |
-| D6 | `ort` in-process behind trait | no network hop, runs most exported models, swappable | `candle`, `tract`, separate server |
-| D7 | Fail closed | slow model must not mean bypass | fail open |
-| D8 | Cargo workspace, 4 crates | compiler enforces boundaries | one crate |
-| D9 | Audit = JSON lines to stdout, no arg values | zero infra; args may hold secrets | DB |
+Reasons and trade-offs: see `ARCHITECTURE.md`.
 
 ## Layout
 
@@ -118,7 +108,7 @@ Env: `SIDECAR_SECRET` (required) · `POLICY_PATH` · `MODEL_KIND` (`heuristic`|`
 | E1 | Mock backend | C2 | `cargo test -p mock-backend` |
 | E2 | End-to-end test, random ports | E1, B5 | `cargo test --test e2e` |
 | D1 | `HeuristicModel` | A3 | `cargo test -p decision-model heuristic` |
-| D2 | Pick model (Kev?): format, license, p50/p99 on laptop | — | add result to Decisions |
+| D2 | Pick model (Kev?): format, license, p50/p99 on laptop | — | add result to `ARCHITECTURE.md` |
 | D3 | Input builder + windowing | A2 | `cargo test -p decision-model input` |
 | D4 | `OnnxModel` | A3, D2 | `cargo test -p decision-model --features onnx` |
 | D5 | Eval fixtures, precision/recall | D1 | `cargo run -p decision-model --example eval` |
