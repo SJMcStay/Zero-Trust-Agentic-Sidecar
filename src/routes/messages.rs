@@ -211,6 +211,7 @@ pub async fn messages_handler(
         mode = ?route_a.mode,
         "A1 request received"
     );
+    tracing::debug!(shape = %request_shape(&json_val), "A1 message roles and blocks (no content)");
 
     // 2. What to score
     let scored = match route_a.score {
@@ -410,6 +411,42 @@ pub async fn messages_handler(
 
     // 5. Forward unchanged
     forward_to_llm(&state, &uri, &headers, body, stream).await
+}
+
+/// `user[text:47,text:3400] assistant[tool_use] user[tool_result:63]`: roles, block types and
+/// text sizes, for seeing what a harness sends without logging the content.
+fn request_shape(body: &Value) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let block = |b: &Value| {
+        let kind = b.get("type").and_then(Value::as_str).unwrap_or("untyped");
+        let chars = b
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|t| t.chars().count())
+            .or_else(|| match b.get("content") {
+                Some(Value::String(t)) => Some(t.chars().count()),
+                _ => None,
+            });
+        match chars {
+            Some(n) => format!("{kind}:{n}"),
+            None => kind.to_string(),
+        }
+    };
+    messages
+        .iter()
+        .map(|m| {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
+            let blocks = match m.get("content") {
+                Some(Value::String(t)) => format!("string:{}", t.chars().count()),
+                Some(Value::Array(items)) => items.iter().map(block).collect::<Vec<_>>().join(","),
+                _ => String::new(),
+            };
+            format!("{role}[{blocks}]")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// "the Read result (/repo/notes.md)" / "the new user text" for block explanations.

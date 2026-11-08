@@ -9,6 +9,14 @@ use zero_trust_agentic_sidecar::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `zero-trust-agentic-sidecar env <cli>`: print the environment that sends an agent CLI's
+    // traffic through the sidecar ([agent_cli_mappings]; used by scripts/agent.sh). Needs only
+    // POLICY_PATH, no secrets.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("env") {
+        std::process::exit(print_agent_env(args.get(2).map(String::as_str)));
+    }
+
     // 1. Initialize tracing subscriber
     // ZT_DEBUG=1 / 2 turns on per-step debug output (see src/debug.rs); RUST_LOG overrides.
     tracing_subscriber::fmt()
@@ -183,5 +191,29 @@ async fn shutdown_signal() {
         _ = terminate => {
             tracing::info!("Received SIGTERM, draining active connections...");
         },
+    }
+}
+
+/// `env <cli>`: one `NAME=value` line per variable, base URL first. Exit 2 on any problem.
+fn print_agent_env(cli: Option<&str>) -> i32 {
+    let Some(cli) = cli else {
+        eprintln!("usage: zero-trust-agentic-sidecar env <cli>");
+        return 2;
+    };
+    let path = std::env::var("POLICY_PATH").unwrap_or_else(|_| "policy.toml".to_string());
+    let result = PolicyEngine::from_file(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|policy| policy.agent_env(cli));
+    match result {
+        Ok(vars) => {
+            for (key, value) in vars {
+                println!("{key}={value}");
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("{path}: {err}");
+            2
+        }
     }
 }

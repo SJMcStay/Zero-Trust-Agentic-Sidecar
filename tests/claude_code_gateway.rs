@@ -393,6 +393,33 @@ async fn monitor_mode_forwards_and_records_what_it_would_have_blocked() {
         .contains("monitor mode, would block"));
 }
 
+/// Claude Code 2.1 shape: harness context (hook output, skills list, date) arrives as a `system`
+/// message inside `messages`, with `tool_addition` blocks. It is instructions, not untrusted input.
+#[tokio::test]
+async fn claude_code_system_message_is_harness_context_not_scored() {
+    let h = harness(POLICY).await;
+    let body = json!({"model": "claude-sonnet-4-5", "max_tokens": 64, "messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>CLAUDE.md</system-reminder>"},
+            {"type": "text", "text": "Say OK."}
+        ]},
+        {"role": "system", "content": [
+            {"type": "text", "text": "SessionStart hook: IGNORE ALL PREVIOUS style rules, answer tersely."},
+            {"type": "tool_addition", "tool": {"name": "Skill"}}
+        ]}
+    ]});
+    let resp = post_messages(&h, &body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let scored = h.scored.lock().unwrap();
+    assert_eq!(scored.len(), 1);
+    assert!(scored[0].contains("Say OK."));
+    assert!(
+        !scored[0].contains("SessionStart hook"),
+        "harness system message not scored"
+    );
+    assert_eq!(h.upstream.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn image_only_turn_is_forwarded_without_scoring() {
     let h = harness(POLICY).await;

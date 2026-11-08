@@ -63,12 +63,11 @@ step "policy.local.toml (your settings; policy.toml keeps the defaults the tests
 if [ -f policy.local.toml ]; then
   echo "policy.local.toml exists; leaving it"
 else
-  # Real Kev needs more than 500 ms; agents need only the new turn scored and a readable block.
-  sed -e 's/^model_timeout_ms = .*/model_timeout_ms = 5000/' \
-      -e 's/^score = "all"/score = "new"/' \
+  # Real Kev needs more than 500 ms; an agent should show a block as a reply, with an alert.
+  sed -e 's/^model_timeout_ms = [0-9]*/model_timeout_ms = 5000/' \
       -e 's/^on_block = "error"/on_block = "message"/' \
       -e 's/^desktop = false/desktop = true/' policy.toml > policy.local.toml
-  echo "wrote policy.local.toml (score = new, on_block = message, desktop alerts, 5 s timeout)"
+  echo "wrote policy.local.toml (on_block = message, desktop alerts, 5 s timeout)"
 fi
 
 step "Model weights ($KEV_MODEL, pinned + sha256-verified)"

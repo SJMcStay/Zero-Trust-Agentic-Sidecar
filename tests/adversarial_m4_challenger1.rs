@@ -420,9 +420,11 @@ async fn test_adversarial_prompt_injection_multi_turn_interrogation() {
     );
 }
 
+/// A `system` message inside `messages` is harness context (Claude Code sends hook output and the skills list this way), scored with the system prompt when `include_system_prompt = true`.
 #[tokio::test]
 async fn test_adversarial_role_confusion_system_role_in_messages_array() {
-    let (app, _, _) = setup_challenger_app(None);
+    let (app, _, _) =
+        setup_challenger_app_with_policy(policy_with_exclude_system_prompt(false), None);
 
     // Adversary attempts role confusion by inserting role: "system" inside messages
     let payload = serde_json::json!({
@@ -450,7 +452,7 @@ async fn test_adversarial_role_confusion_system_role_in_messages_array() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "Role confusion with system role in messages must still be interrogated and blocked"
+        "With include_system_prompt, a system role in messages is interrogated and blocked"
     );
 }
 

@@ -701,6 +701,46 @@ impl PolicyEngine {
         names.sort();
         names
     }
+
+    /// Environment that sends `cli`'s traffic through the sidecar, base URL variable first
+    /// (`zero-trust-agentic-sidecar env <cli>`, used by `scripts/agent.sh`). Refuses CLIs whose
+    /// protocol the sidecar does not serve yet, and names that are not valid variables.
+    pub fn agent_env(&self, cli: &str) -> Result<Vec<(String, String)>, String> {
+        let mapping = self.get_cli_mapping(cli).ok_or_else(|| {
+            format!(
+                "no [agent_cli_mappings.{cli}] in the policy (configured: {})",
+                self.configured_clis().join(", ")
+            )
+        })?;
+        if mapping.protocol != "anthropic" {
+            return Err(format!(
+                "{cli} speaks the '{}' protocol, which the sidecar does not serve yet \
+                 (only 'anthropic'); its traffic would not be inspected",
+                mapping.protocol
+            ));
+        }
+        let mut extra: Vec<(String, String)> = mapping
+            .extra_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        extra.sort();
+        let vars: Vec<(String, String)> =
+            std::iter::once((mapping.env_var.clone(), mapping.sidecar_url.clone()))
+                .chain(extra)
+                .collect();
+        for (key, value) in &vars {
+            let valid_key = !key.is_empty()
+                && !key.starts_with(|c: char| c.is_ascii_digit())
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid_key || value.contains(['\n', '\r', '\0']) {
+                return Err(format!(
+                    "[agent_cli_mappings.{cli}]: invalid variable '{key}'"
+                ));
+            }
+        }
+        Ok(vars)
+    }
 }
 
 #[cfg(test)]
@@ -1650,5 +1690,40 @@ mod tests {
 
         assert!(engine.get_cli_mapping("nonexistent").is_none());
         assert!(engine.get_cli_env("nonexistent").is_none());
+    }
+
+    #[test]
+    fn agent_env_serves_only_anthropic_clis_and_puts_the_base_url_first() {
+        let engine =
+            PolicyEngine::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/policy.toml")).unwrap();
+        let env = engine.agent_env("claude").unwrap();
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "http://127.0.0.1:8080".to_string()
+                ),
+                (
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                    "1".to_string()
+                ),
+            ]
+        );
+        let err = engine.agent_env("codex").unwrap_err();
+        assert!(err.contains("'openai' protocol"), "{err}");
+        let err = engine.agent_env("cursor").unwrap_err();
+        assert!(err.contains("configured: claude, codex, ollama"), "{err}");
+
+        let bad = PolicyEngine::from_str(
+            r#"
+            [defaults]
+            [agent_cli_mappings.x]
+            env_var = "BAD;rm"
+            sidecar_url = "http://127.0.0.1:8080"
+            "#,
+        )
+        .unwrap();
+        assert!(bad.agent_env("x").unwrap_err().contains("invalid variable"));
     }
 }

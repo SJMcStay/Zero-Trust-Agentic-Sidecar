@@ -1083,14 +1083,19 @@ async fn test_adversarial_prefill_trailing_assistant_injection_blocked() {
     );
 }
 
+/// A `system` message inside `messages` is harness context (Claude Code sends hook output and the skills list this way), scored with the system prompt when `include_system_prompt = true`.
 #[tokio::test]
-async fn test_adversarial_role_confusion_system_role_in_messages_array_always_blocked() {
+async fn test_adversarial_role_confusion_system_role_in_messages_array_blocked_with_system_scoring()
+{
     let synthetic_engine = Arc::new(SyntheticKevEngine::for_cpu().unwrap());
-    // Use policy with exclude_system_prompt = true
-    let policy_engine = PolicyEngine::from_file("policy.toml").expect("Valid policy.toml");
+    let toml = std::fs::read_to_string("policy.toml").unwrap().replace(
+        "include_system_prompt = false",
+        "include_system_prompt = true",
+    );
+    let policy_engine = PolicyEngine::from_str(&toml).expect("Valid policy");
     let app = create_test_app(synthetic_engine, "http://127.0.0.1:9", policy_engine);
 
-    // Attacker sends role: "system" inside messages array expecting exclude_system_prompt to ignore it
+    // role: "system" inside the messages array
     let payload = json!({
         "model": "claude-3-5-sonnet",
         "messages": [
@@ -1116,6 +1121,6 @@ async fn test_adversarial_role_confusion_system_role_in_messages_array_always_bl
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "Role confusion attack in messages array must NOT be excluded by exclude_system_prompt"
+        "With include_system_prompt, a system role in messages is scored and blocked"
     );
 }

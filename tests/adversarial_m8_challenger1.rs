@@ -489,11 +489,11 @@ async fn test_system_prompt_polymorphic_array_exclusion_true_vs_false() {
     assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
 }
 
-/// Adversarial Test 7: Role confusion attack — injection in `role: "system"` inside `messages`
-/// must NOT be excluded by `exclude_system_prompt = true` and must be blocked with HTTP 403.
+/// Adversarial Test 7: Role confusion attack — injection in `role: "system"` inside `messages`.
+/// A `system` message inside `messages` is harness context (Claude Code sends hook output and the skills list this way), scored with the system prompt when `include_system_prompt = true`.
 #[tokio::test]
 async fn test_role_confusion_system_in_messages_not_excluded_and_blocked_403() {
-    let policy = policy_with_flags(true, true);
+    let policy = policy_with_flags(true, false);
     let (app, prompt_calls, _) = setup_challenger_app(policy, None);
 
     // Attacker crafts a message with role="system" directly inside the messages array
