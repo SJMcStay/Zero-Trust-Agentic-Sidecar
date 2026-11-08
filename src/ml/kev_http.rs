@@ -4,7 +4,11 @@
 //! typed yes/no questions. The server runs the real Kev checkpoint (MLX on Apple Silicon), so the
 //! answers are Kev's calibrated probabilities. One loopback hop; nothing leaves the machine.
 
-use crate::ml::{window_text, DecisionEngine, MlError};
+pub use crate::ml::MAX_SCORING_WINDOWS as KEV_HTTP_MAX_SCORING_WINDOWS;
+use crate::ml::{
+    truncate_head_tail, window_text, DecisionEngine, MlError, MAX_SCORING_BUDGET_CHARS,
+    MAX_SCORING_WINDOWS,
+};
 use crate::types::{KevVerdict, ToolExecuteRequest};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -164,6 +168,7 @@ impl KevHttpEngine {
 
     /// Max P(injection) over overlapping windows of `text`. `as_untrusted_inputs` wraps each
     /// window as `{"untrusted_inputs": [window]}` so the tool-call question can refer to it.
+    /// Caps window iteration to `MAX_SCORING_WINDOWS` to prevent timeouts.
     async fn injection_over_windows(
         &self,
         text: &str,
@@ -172,14 +177,18 @@ impl KevHttpEngine {
     ) -> Result<f32, MlError> {
         let mut max = 0.0f32;
         let windows = window_text(text, STATE_WINDOW_CHARS, STATE_STRIDE_CHARS);
-        if windows.len() > 1 {
+        let total_windows = windows.len();
+        let capped_windows: Vec<String> = windows.into_iter().take(MAX_SCORING_WINDOWS).collect();
+
+        if total_windows > 1 {
             tracing::debug!(
-                windows = windows.len(),
+                windows = capped_windows.len(),
+                original_windows = total_windows,
                 chars = text.chars().count(),
-                "KEV long text split into windows"
+                "KEV long text split into bounded windows"
             );
         }
-        for chunk in windows {
+        for chunk in capped_windows {
             let state = if as_untrusted_inputs {
                 json!({ "untrusted_inputs": [chunk] })
             } else {
@@ -205,8 +214,13 @@ impl DecisionEngine for KevHttpEngine {
     }
 
     async fn evaluate_prompt(&self, prompt: &str) -> Result<KevVerdict, MlError> {
+        let bounded_prompt = if prompt.chars().count() > MAX_SCORING_BUDGET_CHARS {
+            truncate_head_tail(prompt, MAX_SCORING_BUDGET_CHARS)
+        } else {
+            prompt.to_string()
+        };
         let injection = self
-            .injection_over_windows(prompt, PROMPT_INJECTION, false)
+            .injection_over_windows(&bounded_prompt, PROMPT_INJECTION, false)
             .await?;
         Ok(KevVerdict::new(
             injection,
@@ -239,8 +253,13 @@ impl DecisionEngine for KevHttpEngine {
         } else {
             let intent = self.ask(&call, &[TOOL_INTENT]).await?["intent"];
             let untrusted = req.context.untrusted_inputs.join("\n");
+            let bounded_untrusted = if untrusted.chars().count() > MAX_SCORING_BUDGET_CHARS {
+                truncate_head_tail(&untrusted, MAX_SCORING_BUDGET_CHARS)
+            } else {
+                untrusted
+            };
             (
-                self.injection_over_windows(&untrusted, TOOL_INJECTION, true)
+                self.injection_over_windows(&bounded_untrusted, TOOL_INJECTION, true)
                     .await?,
                 intent,
             )
@@ -364,5 +383,22 @@ mod tests {
         let down = KevHttpEngine::new("http://127.0.0.1:9", "kev-4b").unwrap();
         let err = down.check_ready().await.unwrap_err();
         assert!(err.to_string().contains("scripts/kev_server.sh"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn window_capping_limits_requests_to_max_scoring_windows() {
+        let (url, seen) = fake_kev(r#"{"answers":{"injection":{"type":"noul","noul":0.3}}}"#).await;
+        let engine = KevHttpEngine::new(&url, "kev-4b").unwrap();
+        // 100,000 characters would generate 5 windows without bounds
+        let massive_prompt = "b".repeat(100_000);
+
+        let v = engine.evaluate_prompt(&massive_prompt).await.unwrap();
+        assert!((v.injection_confidence - 0.3).abs() < 1e-6);
+        let count = seen.lock().unwrap().len();
+        assert!(
+            count <= MAX_SCORING_WINDOWS,
+            "Window count {count} must not exceed MAX_SCORING_WINDOWS {MAX_SCORING_WINDOWS}"
+        );
+        assert_eq!(count, 3, "Truncated 64k text generates exactly 3 windows");
     }
 }

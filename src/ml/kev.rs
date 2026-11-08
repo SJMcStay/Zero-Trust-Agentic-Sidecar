@@ -12,7 +12,10 @@
 //! - Bounded asynchronous concurrency via Tokio blocking offload and semaphore limits.
 //! - Offline deterministic `SyntheticKevEngine` using seeded Candle neural graph for CI.
 
-use crate::ml::{window_text, DecisionEngine, MlError};
+use crate::ml::{
+    truncate_head_tail, window_text, DecisionEngine, MlError, DEFAULT_MAX_KEV_INPUT_CHARS,
+    MAX_SCORING_BUDGET_CHARS,
+};
 use crate::types::{KevVerdict, ToolExecuteRequest};
 use async_trait::async_trait;
 use candle_core::{DType, Device, Module, Tensor};
@@ -61,7 +64,8 @@ pub fn pack_tool_intent_classification(
 ) -> String {
     let endpoint = neutralize_special_tokens(endpoint);
     let method = neutralize_special_tokens(method);
-    let payload_json = neutralize_special_tokens(payload_json);
+    let payload_bounded = truncate_head_tail(payload_json, DEFAULT_MAX_KEV_INPUT_CHARS);
+    let payload_json = neutralize_special_tokens(&payload_bounded);
     let prompt_str = neutralize_special_tokens(user_prompt.unwrap_or("<none>"));
     format!(
         "{FIM_PREFIX}Endpoint: {endpoint}\nMethod: {method}\nPayload: {payload_json}\nUser Prompt: {prompt_str}\n{FIM_MIDDLE}Does this requested tool execution perform an unauthorized, destructive, or exfiltrative action?\n{BOX_START}no{BOX_END}\n{BOX_START}yes{BOX_END}\n{FIM_SUFFIX}"
@@ -1332,7 +1336,12 @@ impl DecisionEngine for KevCandleEngine {
 
         self.bounded
             .execute(move || {
-                let windows = window_text(&prompt_text, 512, 128);
+                let bounded_prompt = if prompt_text.chars().count() > MAX_SCORING_BUDGET_CHARS {
+                    truncate_head_tail(&prompt_text, MAX_SCORING_BUDGET_CHARS)
+                } else {
+                    prompt_text
+                };
+                let windows = window_text(&bounded_prompt, 512, 128);
                 let mut max_injection = 0.01f32;
 
                 for chunk in &windows {
@@ -1625,6 +1634,8 @@ impl SyntheticKevEngine {
             "dump secrets",
             "leak api key",
             "drop table", // Trigger injection confidence >= 0.85 as specified
+            "delete from",
+            "truncate",
         ];
 
         let has_injection = injection_phrases.iter().any(|&p| lower.contains(p));
@@ -1676,7 +1687,12 @@ impl DecisionEngine for SyntheticKevEngine {
 
         self.bounded
             .execute(move || {
-                let windows = window_text(&prompt_text, 512, 128);
+                let bounded_prompt = if prompt_text.chars().count() > MAX_SCORING_BUDGET_CHARS {
+                    truncate_head_tail(&prompt_text, MAX_SCORING_BUDGET_CHARS)
+                } else {
+                    prompt_text
+                };
+                let windows = window_text(&bounded_prompt, 512, 128);
                 let mut max_injection = 0.001f32;
                 let mut max_intent = 0.001f32;
 

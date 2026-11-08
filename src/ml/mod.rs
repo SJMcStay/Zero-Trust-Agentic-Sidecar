@@ -75,8 +75,72 @@ pub trait DecisionEngine: Send + Sync {
 }
 
 // ==============================================================================
-// 3. Sliding-Window Text & Token Chunking
+// 3. Sliding-Window Text & Token Chunking & Head-Tail Truncation
 // ==============================================================================
+
+/// Default maximum tokens Kev is calibrated for (8,192 tokens).
+pub const DEFAULT_MAX_KEV_TOKENS: usize = 8_192;
+
+/// Character budget multiplier per Kev token (~3 characters per token).
+pub const CHARS_PER_TOKEN: usize = 3;
+
+/// Default maximum character budget per Kev window (8,192 tokens * 3 = 24,000 characters).
+pub const DEFAULT_MAX_KEV_INPUT_CHARS: usize = 24_000;
+
+/// Maximum number of sliding windows evaluated by Kev to guarantee completion under model_timeout_ms.
+pub const MAX_SCORING_WINDOWS: usize = 3;
+
+/// Maximum character budget for bounded multi-window scoring (24,000 + 2 * 20,000 = 64,000 chars).
+pub const MAX_SCORING_BUDGET_CHARS: usize = 64_000;
+
+/// Explicit truncation marker inserted when head-tail truncation is applied.
+pub const KEV_TRUNCATION_MARKER: &str = "[... input elided for Kev token budget ...]";
+
+/// Applies head-tail truncation to preserve both head and tail instructions
+/// within a character budget `max_chars`, inserting `KEV_TRUNCATION_MARKER` in between.
+///
+/// Strictly preserves UTF-8 character boundaries without panicking.
+pub fn truncate_head_tail(text: &str, max_chars: usize) -> String {
+    truncate_head_tail_with_marker(text, max_chars, KEV_TRUNCATION_MARKER)
+}
+
+/// Applies head-tail truncation using a custom marker string.
+pub fn truncate_head_tail_with_marker(text: &str, max_chars: usize, marker: &str) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let marker_char_count = marker.chars().count();
+    if max_chars <= marker_char_count {
+        return marker.chars().take(max_chars).collect();
+    }
+
+    let budget = max_chars - marker_char_count;
+    let head_count = budget / 2;
+    let tail_count = budget - head_count;
+
+    // Find head byte offset safely on UTF-8 char boundary
+    let head_byte_offset = text
+        .char_indices()
+        .nth(head_count)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+
+    // Find tail byte offset safely on UTF-8 char boundary
+    let tail_byte_offset = text
+        .char_indices()
+        .nth(char_count - tail_count)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    let mut result =
+        String::with_capacity(head_byte_offset + marker.len() + (text.len() - tail_byte_offset));
+    result.push_str(&text[..head_byte_offset]);
+    result.push_str(marker);
+    result.push_str(&text[tail_byte_offset..]);
+    result
+}
 
 /// Splits a UTF-8 text string into overlapping character windows.
 ///
@@ -247,5 +311,47 @@ mod tests {
         let empty = aggregate_verdicts(&[], "model_test");
         assert!(empty.is_safe(0.70, 0.50));
         assert_eq!(empty.injection_confidence, 0.01);
+    }
+
+    #[test]
+    fn test_truncate_head_tail_short_and_exact() {
+        assert_eq!(truncate_head_tail("", 100), "");
+        assert_eq!(truncate_head_tail("hello world", 100), "hello world");
+        assert_eq!(truncate_head_tail("exact length", 12), "exact length");
+    }
+
+    #[test]
+    fn test_truncate_head_tail_preservation() {
+        let head = "HEAD_SECTION_START_".repeat(100); // 1,900 chars
+        let middle = "MIDDLE_SECRET_PAYLOAD_TO_DROP_".repeat(200); // 6,000 chars
+        let tail = "_TAIL_SECTION_END".repeat(100); // 1,700 chars
+        let full = format!("{head}{middle}{tail}");
+
+        let truncated = truncate_head_tail(&full, 1_000);
+        assert_eq!(truncated.chars().count(), 1_000);
+        assert!(truncated.starts_with("HEAD_SECTION_START_"));
+        assert!(truncated.ends_with("_TAIL_SECTION_END"));
+        assert!(truncated.contains(KEV_TRUNCATION_MARKER));
+        assert!(!truncated.contains("MIDDLE_SECRET_PAYLOAD_TO_DROP_"));
+    }
+
+    #[test]
+    fn test_truncate_head_tail_multibyte_utf8() {
+        let emojis = "🦀🚀🔥🔐🛡️⚡️".repeat(200);
+        let truncated = truncate_head_tail(&emojis, 100);
+        assert_eq!(truncated.chars().count(), 100);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert!(truncated.contains(KEV_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn test_truncate_head_tail_budget_smaller_than_marker() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let truncated = truncate_head_tail(text, 10);
+        assert_eq!(truncated.chars().count(), 10);
+        assert_eq!(
+            truncated,
+            KEV_TRUNCATION_MARKER.chars().take(10).collect::<String>()
+        );
     }
 }
