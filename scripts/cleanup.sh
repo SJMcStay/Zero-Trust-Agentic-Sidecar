@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Delete locally generated files. Never touches tracked files, Rust, or uv.
+# Delete locally generated files. Never touches tracked files, .env, Rust or uv.
 #
-#   scripts/cleanup.sh               # build output + Kev server checkout
+#   scripts/cleanup.sh               # builds, Kev server checkout, venv, Python caches
 #   scripts/cleanup.sh --models      # also downloaded weights (models/)
 #   scripts/cleanup.sh --hf-cache    # also Hugging Face cache copies of models in models.json
 #   scripts/cleanup.sh --all         # all of the above
@@ -22,12 +22,12 @@ for arg in "$@"; do
   esac
 done
 
-targets=("$ROOT/target" "$ROOT/.kev-server")
+targets=("$ROOT/target" "$ROOT/.kev-server" "$ROOT/.venv" "$ROOT/.pytest_cache" "$ROOT/backend/__pycache__")
 [ "$models" = 1 ] && targets+=("$ROOT/models")
 if [ "$hf" = 1 ]; then
   # Hub cache layout: models--<org>--<name>
   while read -r repo; do targets+=("$HF_HUB/models--${repo//\//--}"); done < <(
-    python3 -c "import json; [print(m['repo']) for m in json.load(open('$ROOT/models.json')).values() if m.get('repo')]")
+    python3 -c "import json; [print(m['repo']) for m in json.load(open('$ROOT/models.json')).values()]")
 fi
 
 found=()
