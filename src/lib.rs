@@ -6,6 +6,7 @@
 //! (local, see `ml`), two-legged cryptographic authorization, and deterministic
 //! policy enforcement.
 
+pub mod alerts;
 pub mod audit;
 pub mod config;
 pub mod crypto;

@@ -29,6 +29,16 @@ The sidecar exits at startup if Kev is not answering (fail closed). The backend 
 
 Set `ZT_DEBUG=1` on any part to see each step of real traffic; `ZT_DEBUG=2` adds text previews (may contain secrets: local use only).
 
+## Local security alerts and approval
+
+Run the optional desktop notifier in another terminal after starting the sidecar:
+
+```bash
+set -a && . ./.env && set +a && python3 scripts/alert_notifier.py
+```
+
+It uses `JWT_SECRET` as a bearer token for the loopback-only `GET /v1/alerts` stream and decision endpoint. The sidecar keeps up to 128 recent alerts in memory. Route B calls with model scores no more than 0.10 above a configured risk threshold wait for `human_approval_timeout_ms` (15 seconds in `policy.toml`). The notifier offers **Allow once** or **Block**. Approval applies only to that request and cannot override deterministic policy checks. Missing or timed-out decisions block the call. On Linux, install `notify-send` for alerts and `zenity` for approval dialogs; macOS uses `osascript`, and Windows uses a local dialog.
+
 | Where | Prints |
 | --- | --- |
 | sidecar | `A1`..`A6` (Route A), `B1`..`B7` (Route B), `KEV` (each Kev call): input sizes, scores, the rule that decided, forward URL, status, timings |

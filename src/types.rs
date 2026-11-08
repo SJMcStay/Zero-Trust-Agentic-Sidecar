@@ -348,6 +348,10 @@ fn default_model_timeout() -> u64 {
     500
 }
 
+fn default_human_approval_timeout() -> u64 {
+    0
+}
+
 fn default_true() -> bool {
     true
 }
@@ -369,6 +373,9 @@ pub struct DefaultPolicy {
     pub max_malicious_intent: f32,
     #[serde(default = "default_model_timeout")]
     pub model_timeout_ms: u64,
+    /// Wait for a human decision on a borderline Route B score; zero disables the hold.
+    #[serde(default = "default_human_approval_timeout")]
+    pub human_approval_timeout_ms: u64,
     #[serde(default = "default_true")]
     pub fail_closed: bool,
     #[serde(default = "default_true")]
@@ -381,6 +388,7 @@ impl Default for DefaultPolicy {
             max_injection_confidence: default_max_injection(),
             max_malicious_intent: default_max_intent(),
             model_timeout_ms: default_model_timeout(),
+            human_approval_timeout_ms: default_human_approval_timeout(),
             fail_closed: true,
             require_jwt: true,
         }

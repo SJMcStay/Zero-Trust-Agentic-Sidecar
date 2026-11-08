@@ -121,6 +121,12 @@ impl std::str::FromStr for PolicyEngine {
                 config.defaults.max_malicious_intent
             )));
         }
+        if config.defaults.human_approval_timeout_ms > 60_000 {
+            return Err(PolicyError::ValidationError(format!(
+                "human_approval_timeout_ms must be 0 or at most 60000, got {}",
+                config.defaults.human_approval_timeout_ms
+            )));
+        }
 
         let mut compiled_endpoints = HashMap::with_capacity(config.endpoints.len());
 

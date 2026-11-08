@@ -191,6 +191,7 @@ Response: `{"answers": {"injection": {"type": "noul", "noul": 0.91}, "intent": {
 max_injection_confidence = 0.70
 max_malicious_intent = 0.50
 model_timeout_ms = 500
+human_approval_timeout_ms = 15000 # 0 disables human approval; maximum 60000
 fail_closed = true
 require_jwt = true
 
@@ -251,7 +252,7 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 | R1 | Route A: score only new content ([proposal](proposals/score-new-content.md)) | a 50-turn Claude Code session stays under the timeout |
 | R2 | Route A: buffer and score outbound `tool_use` blocks in streamed responses | recorded-stream test |
 | G1 | Claude Code gateway compliance: `/v1/messages?beta=true`, pass through `count_tokens`, `/v1/models`, `HEAD /api/hello`, all `anthropic-*` headers ([proposal](proposals/alerts-and-agents.md)) | Claude Code runs a session through the sidecar |
-| AL1–AL3 | Answer the agent in its own protocol instead of a 403; alert stream `GET /v1/alerts`; pop-up app; optional allow-once | blocked call shows a pop-up and the agent continues |
+| AL1–AL3 | Authenticated in-memory alert stream; local notifier; one-time approval for borderline Route B calls | stream + native notifier; timeout blocks; approval applies once |
 | AD1–AD3 | Adapters: OpenAI-compatible (Ollama, LM Studio, vLLM), Codex (Responses API), Gemini | same verdicts and alerts for each agent |
 | E1 | Eval fixtures (benign / injected prompts and tool calls); precision/recall for kev-0.8b vs kev-4b; set thresholds | numbers in ARCHITECTURE 3.6 |
 | E2 | Latency per route on team Macs; set `model_timeout_ms` | numbers in ARCHITECTURE 3.4 |

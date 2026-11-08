@@ -18,7 +18,9 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{audit::AuditLogger, config::Config, ml::DecisionEngine, policy::PolicyEngine};
+use crate::{
+    alerts::AlertHub, audit::AuditLogger, config::Config, ml::DecisionEngine, policy::PolicyEngine,
+};
 
 pub use execute::execute_handler;
 pub use messages::messages_handler;
@@ -31,6 +33,7 @@ pub struct AppState {
     pub decision_engine: Arc<dyn DecisionEngine>,
     pub audit_logger: Arc<AuditLogger>,
     pub http_client: reqwest::Client,
+    pub alert_hub: AlertHub,
 }
 
 impl AppState {
@@ -48,6 +51,7 @@ impl AppState {
             decision_engine,
             audit_logger,
             http_client,
+            alert_hub: AlertHub::default(),
         }
     }
 
@@ -69,6 +73,7 @@ impl AppState {
             decision_engine,
             audit_logger: Arc::new(audit_logger),
             http_client,
+            alert_hub: AlertHub::default(),
         }
     }
 
@@ -152,6 +157,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/healthz", get(healthz_handler))
         .route("/v1/messages", post(messages::messages_handler))
         .route("/api/execute", post(execute::execute_handler))
+        .route("/v1/alerts", get(crate::alerts::stream))
+        .route("/v1/alerts/:id/decision", post(crate::alerts::decide))
         .layer(axum::middleware::from_fn(trace_middleware))
         .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(state)

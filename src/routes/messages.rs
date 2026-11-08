@@ -337,6 +337,23 @@ pub async fn messages_handler(
     let max_intent = state.policy_engine.defaults().max_malicious_intent;
 
     if verdict.injection_confidence >= max_injection || verdict.malicious_intent >= max_intent {
+        state.alert_hub.publish(crate::alerts::new_alert(
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown"),
+            headers
+                .get("x-claude-code-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            "POST /v1/messages",
+            "/v1/messages",
+            "model_risk_high",
+            PROMPT_INJECTION_MESSAGE,
+            Some(verdict.injection_confidence),
+            Some(verdict.malicious_intent),
+            false,
+        ));
         tracing::debug!(
             injection = verdict.injection_confidence,
             max_injection,

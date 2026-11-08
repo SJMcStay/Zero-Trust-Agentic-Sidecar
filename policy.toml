@@ -2,6 +2,7 @@
 max_injection_confidence = 0.70
 max_malicious_intent = 0.50
 model_timeout_ms = 500
+human_approval_timeout_ms = 15000 # 0 disables; at most 60000
 fail_closed = true
 require_jwt = true
 
