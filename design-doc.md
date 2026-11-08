@@ -14,17 +14,20 @@ Agent CLI (Claude Code / Qwen)
   ▼
 [Axum Route A Handler]          (policy file re-read when it changes)
   ├─► What to score ([route_a] score):
-  │     • "new": tool results, inlined @files and typed text since the model's last turn;
-  │       harness <system-reminder> text skipped, tool output never skipped
+  │     • "new" (default): everything after the last completed assistant turn — tool results,
+  │       inlined @files, typed text, a trailing prefill, untyped blocks; harness <system-reminder>
+  │       text skipped, tool output never skipped; system prompt and in-conversation `system`
+  │       messages only with include_system_prompt
   │     • "all": system prompt and every message
   ├─► Conversation still carries content blocked earlier? ──► block (remember_blocked)
-  ├─► Kev: injection_confidence (one state; overlapping windows for long turns)
+  ├─► Kev: injection_confidence (one state; every overlapping window for long turns, nothing cut)
   ├─► Thresholds
   │     ├─► FAIL (≥ threshold, model error or timeout)
   │     │     ├─► mode = "monitor": log + alert, forward anyway
   │     │     └─► audit + desktop alert ──► 403, or an assistant message the agent shows (on_block)
   │     └─► PASS ──► forward unchanged (body, anthropic-* headers, query) with the sidecar's
-  │                  x-api-key or the agent's own login; stream the response back
+  │                  x-api-key or the agent's own login; stream the response back (error
+  │                  bodies scrubbed of credentials)
 Relayed unscored: POST /v1/messages/count_tokens · GET /v1/models · HEAD|GET /api/hello
 ```
 
@@ -39,7 +42,7 @@ Agent / LLM Tool-Call
   ├─► Parallel Interrogation (`tokio::join!`):
   │     ├─► 1. Zero-Trust Policy Engine (`policy.toml` + JWT/Signature Auth):
   │     │     • Verify caller JWT / signature & expiration
-  │     │     • Check target endpoint allowlist (`/api/v1/system/status` vs `/api/v1/db/drop`)
+  │     │     • Check target endpoint or local tool allowlist (`/api/v1/db/drop` disabled; `[tools."bash"]`)
   │     │     • Check caller role permissions (`allowed_roles`)
   │     │     • Validate required JSON arguments, `max_len`, and linear-time `regex` constraints
   │     └─► 2. Kev (one forward pass, two questions):
@@ -52,10 +55,11 @@ Agent / LLM Tool-Call
   │     4. `missing_arg`        (403 — required payload field missing)
   │     5. `constraint_failed`  (403 — regex or max_len violation)
   │     6. `model_unavailable`  (403 — fail-closed on timeout/inference error)
-  │     7. `model_risk_high`    (403 — Kev `injection_confidence` or `malicious_intent` ≥ threshold)
+  │     7. `model_risk_high`    (403 — Kev score ≥ threshold; per endpoint / tool overrides)
   └─► If ALLOWED:
         ├─► Sign request body with `X-Sidecar-Timestamp` + `X-Sidecar-Signature` (HMAC-SHA256)
-        └─► Forward via Reqwest to Python Flask Backend (`http://localhost:5000<endpoint>`)
+        ├─► Endpoint: forward via Reqwest to the Flask backend (`FLASK_BACKEND_URL<endpoint>`)
+        └─► Local tool: return the signed allow; the agent runs the tool
 ```
 
 ---
@@ -113,6 +117,8 @@ Agent / LLM Tool-Call
   }
 }
 ```
+
+A local tool call names the tool instead of an endpoint: `{"session_id": "s1", "tool": "bash", "args": {"command": "ls -la"}}` (aliases: `tool_name` / `name`, `arguments` / `parameters`; `"endpoint": "tool:bash"` or `"/tools/bash"` also work). Its allow carries `backend_response: {"status": "approved", "tool", "timestamp", "signature"}`.
 
 **Allowed Response (`200 OK`)**:
 ```json
@@ -191,39 +197,18 @@ Response: `{"answers": {"injection": {"type": "noul", "noul": 0.91}, "intent": {
 
 ## 4. Zero-Trust Policy Configuration (`policy.toml`)
 
-```toml
-[defaults]
-max_injection_confidence = 0.70
-max_malicious_intent = 0.50
-model_timeout_ms = 500
-fail_closed = true
-require_jwt = true
+Strict: unknown keys, thresholds outside 0..1 and timeouts outside 1..60000 ms are rejected at load. Edits apply within a second; a bad edit keeps the last good policy. Full annotated file: `policy.toml`.
 
-[endpoints."/api/v1/system/status"]
-backend_url = "http://127.0.0.1:5000/api/v1/system/status"
-allowed_methods = ["GET", "POST"]
-allowed_roles = ["agent", "admin", "readonly"]
-required_args = ["service"]
-constraints.service = { regex = "^[a-z0-9-]+$", max_len = 64 }
+| Table | Holds |
+| --- | --- |
+| `[defaults]` | `max_injection_confidence`, `max_malicious_intent`, `model_timeout_ms`, `fail_closed`, `require_jwt` |
+| `[route_a]` | `mode`, `score`, `include_user_text`, `include_system_prompt`, `on_block`, `remember_blocked`, `context_chars`, `skip_patterns`, `inline_tool_output_patterns`, `tool_output_skip_patterns` |
+| `[alerts]` | `desktop` |
+| `[endpoints."<path>"]` | `backend_url`, `enabled`, `allowed_methods`, `allowed_roles`, `required_args`, `constraints.<arg> = { regex, max_len }`, optional threshold / timeout overrides |
+| `[tools."<name>"]` | as endpoints, without `backend_url` / methods |
+| `[agent_cli_mappings.<cli>]` | `env_var`, `sidecar_url`, `api_key_env_var`, `upstream_url`, `protocol`, `extra_env` |
 
-[endpoints."/api/v1/email/send"]
-backend_url = "http://127.0.0.1:5000/api/v1/email/send"
-allowed_methods = ["POST"]
-allowed_roles = ["agent", "admin"]
-required_args = ["to", "body"]
-constraints.to = { regex = "^[^@]+@ourcompany\\.com$", max_len = 128 }
-constraints.body = { max_len = 2000 }
-
-[endpoints."/api/v1/db/drop"]
-backend_url = "http://127.0.0.1:5000/api/v1/db/drop"
-allowed_methods = ["POST"]
-# Explicitly disabled / empty allowed_roles so any agent attempt to call /api/v1/db/drop is blocked
-enabled = false
-allowed_roles = []
-required_args = ["table"]
-```
-
-With real Kev use `policy.local.toml` (written by `scripts/init.sh`, `model_timeout_ms = 5000`, selected by `POLICY_PATH`); `policy.toml` keeps 500 ms because the tests depend on it.
+With real Kev use `policy.local.toml` (written by `scripts/init.sh`: `model_timeout_ms = 5000`, `on_block = "message"`, desktop alerts; selected by `POLICY_PATH`); `policy.toml` keeps 500 ms because the tests depend on it.
 
 ---
 
@@ -253,11 +238,13 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 | K2 | Candle: partial RoPE (64 of 256 dims, θ = 1e7), per-head q/gate split, plain-weight gated RMSNorm | hidden states match the reference |
 | K3 | Candle: Kev encoder parity (no `\n` separators, one row per question) + golden probabilities from the Kev server | within 0.02 of the server on fixtures |
 | K4 | Candle: BF16 weights on Metal, shapes from `config.json` (Kev-4B) | kev-4b loads and passes K3 |
-| R1 | Done (`score = "new"`): score only new content ([proposal](proposals/score-new-content.md)). Left: time a 50-turn session | a 50-turn Claude Code session stays under the timeout |
+| R1 | Done (`score = "new"`, default): score only new content ([proposal](proposals/score-new-content.md)). Left: time a 50-turn session | a 50-turn Claude Code session stays under the timeout |
 | R2 | Route A: buffer and score outbound `tool_use` blocks in streamed responses | recorded-stream test |
 | G1 | Done: Claude Code gateway compliance: `/v1/messages?beta=true`, pass through `count_tokens`, `/v1/models`, `HEAD /api/hello`, all `anthropic-*` headers ([proposal](proposals/alerts-and-agents.md)) | Claude Code runs a session through the sidecar |
 | AL1 | Done (`on_block = "message"`, `[alerts] desktop`): answer in the agent's protocol; desktop notification | blocked call shows a pop-up and the agent shows why |
 | AL2–AL3 | Alert stream `GET /v1/alerts` for a tray app; optional allow-once | allow-once lets one blocked call through |
+| M5 | Done: merge of #5 (strict schema, per-endpoint / per-tool overrides, `[tools]`, CLI mappings, redaction, config validation, prefill) with #6 | `cargo test` green, Claude Code verified through `scripts/agent.sh` |
+| H1 | Claude Code `PreToolUse` hook that sends each Bash / Edit / WebFetch call to `/api/execute` (`[tools]`) and blocks on deny; realistic `bash` rule | a dangerous Bash command is stopped before it runs |
 | AD1–AD3 | Adapters: OpenAI-compatible (Ollama, LM Studio, vLLM), Codex (Responses API), Gemini | same verdicts and alerts for each agent |
 | E1 | Eval fixtures (benign / injected prompts and tool calls); precision/recall for kev-0.8b vs kev-4b; set thresholds | numbers in ARCHITECTURE 3.6 |
 | E2 | Latency per route on team Macs; set `model_timeout_ms` | numbers in ARCHITECTURE 3.4 |
@@ -266,6 +253,7 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 
 - Kev-4B on 16 GB Macs: does MLX serving fit next to an IDE? If not, those machines use kev-0.8b.
 - Thresholds 0.70 / 0.50 are not yet validated against Kev's scores (E1). Kev-0.8B scored an obvious injection ~0.6: calibrate in `mode = "monitor"` before enforcing.
+- `score = "new"` trusts the history the agent resends. For clients that may fabricate history (multi-tenant web apps), use `score = "all"`.
 - CORS allows any origin (`tests/test_routes.rs` asserts it). With `ANTHROPIC_API_KEY` set in the sidecar, a web page could spend that key through `localhost`. Restrict origins before holding a real key; with the agent's own login passing through there is no key to spend.
 - `remember_blocked` is in memory: a restart forgets blocked content.
 - Codex and Antigravity: confirm each can point at a custom base URL (AD2, AD3).
