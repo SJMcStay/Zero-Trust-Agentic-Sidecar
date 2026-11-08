@@ -13,6 +13,7 @@ Invariants. Breaking one breaks the security model.
 5. **Contracts live in one place.** `crates/common` holds types, trait, signing. Other crates never redefine them.
 6. **Never block the async runtime.** CPU-heavy inference runs in `spawn_blocking`.
 7. **Never log argument values.** Args may carry secrets or customer data. Log tool, decision, rule, scores, latency only.
+8. **Local only at runtime.** Model inference and every hop between our processes stay on loopback. Network is for setup (crates, weights, deps) only; the Kev server binds `127.0.0.1` and runs with `HF_HUB_OFFLINE=1`; `KevHttp` defaults to loopback and is built without TLS, so it cannot call HTTPS services.
 
 ## Critical decisions
 
