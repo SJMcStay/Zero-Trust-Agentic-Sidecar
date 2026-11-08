@@ -17,8 +17,8 @@ use thiserror::Error;
 
 use crate::turn::TurnRules;
 use crate::types::{
-    AgentClaims, AlertPolicy, DefaultPolicy, DenyRule, PolicyConfig, RouteAPolicy,
-    ToolExecuteRequest,
+    AgentClaims, AgentCliMapping, AlertPolicy, ArgConstraint, DefaultPolicy, DenyRule,
+    PolicyConfig, RouteAPolicy, ToolExecuteRequest,
 };
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -39,7 +39,7 @@ pub enum PolicyError {
     #[error("failed to deserialize policy TOML: {0}")]
     ParseError(#[from] toml::de::Error),
 
-    #[error("failed to compile linear-time regex '{pattern}' for argument '{arg}' in endpoint '{endpoint}': {source}")]
+    #[error("failed to compile linear-time regex '{pattern}' for argument '{arg}' in target '{endpoint}': {source}")]
     InvalidRegex {
         endpoint: String,
         arg: String,
@@ -76,6 +76,27 @@ pub struct CompiledEndpointRule {
     pub required_args: Vec<String>,
     /// Constraints applied per argument key.
     pub constraints: HashMap<String, CompiledArgConstraint>,
+    /// Optional endpoint-specific risk threshold overrides.
+    pub max_injection_confidence: Option<f32>,
+    pub max_malicious_intent: Option<f32>,
+    pub model_timeout_ms: Option<u64>,
+}
+
+/// Pre-compiled tool access rule for deterministic CLI tool execution evaluation.
+#[derive(Debug, Clone)]
+pub struct CompiledToolRule {
+    /// Whether the tool is active and callable.
+    pub enabled: bool,
+    /// Permitted caller roles from JWT claims (e.g. `["agent", "admin"]`).
+    pub allowed_roles: Vec<String>,
+    /// Required argument keys in tool payload.
+    pub required_args: Vec<String>,
+    /// Constraints applied per argument key.
+    pub constraints: HashMap<String, CompiledArgConstraint>,
+    /// Optional tool-specific risk threshold overrides.
+    pub max_injection_confidence: Option<f32>,
+    pub max_malicious_intent: Option<f32>,
+    pub model_timeout_ms: Option<u64>,
 }
 
 /// Thread-safe deterministic policy evaluation engine.
@@ -84,12 +105,91 @@ pub struct CompiledEndpointRule {
 /// allowing concurrent, lock-free evaluation across Tokio worker threads.
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
-    /// Raw deserialized policy configuration (defaults and rules).
+    /// Raw deserialized policy configuration (defaults, endpoints, tools, CLI mappings).
     config: PolicyConfig,
     /// Pre-compiled endpoints indexed by target endpoint path for O(1) lookup.
     compiled_endpoints: HashMap<String, CompiledEndpointRule>,
     /// `[route_a]` patterns compiled, for reading new turns.
     turn_rules: TurnRules,
+    /// Pre-compiled tools indexed by tool name for O(1) lookup.
+    compiled_tools: HashMap<String, CompiledToolRule>,
+}
+
+/// Pre-compiles raw argument constraints into linear-time Regex instances.
+fn compile_constraints(
+    target_name: &str,
+    raw_constraints: &HashMap<String, ArgConstraint>,
+) -> Result<HashMap<String, CompiledArgConstraint>, PolicyError> {
+    let mut compiled = HashMap::with_capacity(raw_constraints.len());
+    for (arg_name, constraint) in raw_constraints {
+        let compiled_re = match &constraint.regex {
+            Some(pat) => {
+                let re = Regex::new(pat).map_err(|e| PolicyError::InvalidRegex {
+                    endpoint: target_name.to_string(),
+                    arg: arg_name.clone(),
+                    pattern: pat.clone(),
+                    source: e,
+                })?;
+                Some(re)
+            }
+            None => None,
+        };
+
+        compiled.insert(
+            arg_name.clone(),
+            CompiledArgConstraint {
+                regex: compiled_re,
+                max_len: constraint.max_len,
+            },
+        );
+    }
+    Ok(compiled)
+}
+
+/// Validates payload required arguments and constraints with deterministic key ordering.
+fn validate_payload_args_and_constraints(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    required_args: &[String],
+    constraints: &HashMap<String, CompiledArgConstraint>,
+) -> Result<(), DenyRule> {
+    // 1. Required arguments presence and non-null validation
+    for req_arg in required_args {
+        match payload.get(req_arg) {
+            Some(val) if !val.is_null() => {}
+            _ => return Err(DenyRule::MissingArg),
+        }
+    }
+
+    // 2. Argument constraints validation (sorted keys for deterministic evaluation)
+    let mut sorted_keys: Vec<_> = constraints.keys().collect();
+    sorted_keys.sort();
+
+    for arg_name in sorted_keys {
+        let constraint = &constraints[arg_name];
+        if let Some(val) = payload.get(arg_name) {
+            if val.is_null() {
+                return Err(DenyRule::ConstraintFailed);
+            }
+
+            let str_val = val.as_str().ok_or(DenyRule::ConstraintFailed)?;
+
+            // Maximum Unicode scalar character length
+            if let Some(max_len) = constraint.max_len {
+                if str_val.chars().count() > max_len {
+                    return Err(DenyRule::ConstraintFailed);
+                }
+            }
+
+            // Linear-time regular expression match
+            if let Some(re) = &constraint.regex {
+                if !re.is_match(str_val) {
+                    return Err(DenyRule::ConstraintFailed);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl PolicyEngine {
@@ -116,20 +216,29 @@ impl std::str::FromStr for PolicyEngine {
     fn from_str(toml_str: &str) -> Result<Self, Self::Err> {
         let config: PolicyConfig = toml::from_str(toml_str)?;
 
-        // Validate operational thresholds (must be bounded in [0.0, 1.0])
-        if !(0.0..=1.0).contains(&config.defaults.max_injection_confidence) {
+        // 1. Validate operational thresholds (must be bounded in [0.0, 1.0] and !is_nan())
+        let max_inj = config.defaults.max_injection_confidence;
+        if !(0.0..=1.0).contains(&max_inj) || max_inj.is_nan() {
             return Err(PolicyError::ValidationError(format!(
-                "max_injection_confidence must be between 0.0 and 1.0, got {}",
-                config.defaults.max_injection_confidence
+                "max_injection_confidence must be between 0.0 and 1.0, got {max_inj}"
             )));
         }
-        if !(0.0..=1.0).contains(&config.defaults.max_malicious_intent) {
+        let max_intent = config.defaults.max_malicious_intent;
+        if !(0.0..=1.0).contains(&max_intent) || max_intent.is_nan() {
             return Err(PolicyError::ValidationError(format!(
-                "max_malicious_intent must be between 0.0 and 1.0, got {}",
-                config.defaults.max_malicious_intent
+                "max_malicious_intent must be between 0.0 and 1.0, got {max_intent}"
             )));
         }
 
+        // 2. Validate global model timeout [1, 60_000] ms
+        let timeout = config.defaults.model_timeout_ms;
+        if !(1..=60_000).contains(&timeout) {
+            return Err(PolicyError::ValidationError(format!(
+                "model_timeout_ms must be between 1 and 60000, got {timeout}"
+            )));
+        }
+
+        // 2b. Route A settings: bounded context, regexes compiled once
         if config.route_a.context_chars > 20_000 {
             return Err(PolicyError::ValidationError(format!(
                 "route_a.context_chars must be at most 20000, got {}",
@@ -160,36 +269,71 @@ impl std::str::FromStr for PolicyEngine {
                 &route_a.inline_tool_output_patterns,
             )?,
             include_user_text: route_a.include_user_text,
+            include_system_prompt: route_a.include_system_prompt,
             context_chars: route_a.context_chars,
         };
 
+        // 3. Compile and validate endpoints
         let mut compiled_endpoints = HashMap::with_capacity(config.endpoints.len());
 
         for (endpoint_path, endpoint_rule) in &config.endpoints {
-            let mut compiled_constraints = HashMap::with_capacity(endpoint_rule.constraints.len());
-
-            for (arg_name, constraint) in &endpoint_rule.constraints {
-                let compiled_re = match &constraint.regex {
-                    Some(pat) => {
-                        let re = Regex::new(pat).map_err(|e| PolicyError::InvalidRegex {
-                            endpoint: endpoint_path.clone(),
-                            arg: arg_name.clone(),
-                            pattern: pat.clone(),
-                            source: e,
-                        })?;
-                        Some(re)
-                    }
-                    None => None,
-                };
-
-                compiled_constraints.insert(
-                    arg_name.clone(),
-                    CompiledArgConstraint {
-                        regex: compiled_re,
-                        max_len: constraint.max_len,
-                    },
-                );
+            // Validate endpoint path format
+            if endpoint_path.trim().is_empty() || !endpoint_path.starts_with('/') {
+                return Err(PolicyError::ValidationError(format!(
+                    "endpoint path '{endpoint_path}' must start with '/' and not be empty"
+                )));
             }
+
+            // Validate backend URL using reqwest::Url::parse
+            let parsed_url = reqwest::Url::parse(&endpoint_rule.backend_url).map_err(|e| {
+                PolicyError::ValidationError(format!(
+                    "invalid backend_url '{}' for endpoint '{endpoint_path}': {e}",
+                    endpoint_rule.backend_url
+                ))
+            })?;
+
+            if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+                return Err(PolicyError::ValidationError(format!(
+                    "backend_url '{}' for endpoint '{endpoint_path}' must use http or https scheme, got '{}'",
+                    endpoint_rule.backend_url,
+                    parsed_url.scheme()
+                )));
+            }
+
+            if parsed_url.host_str().is_none_or(|h| h.is_empty()) {
+                return Err(PolicyError::ValidationError(format!(
+                    "backend_url '{}' for endpoint '{endpoint_path}' must have a valid non-empty host",
+                    endpoint_rule.backend_url
+                )));
+            }
+
+            // Validate per-endpoint threshold overrides
+            if let Some(inj) = endpoint_rule.max_injection_confidence {
+                if !(0.0..=1.0).contains(&inj) || inj.is_nan() {
+                    return Err(PolicyError::ValidationError(format!(
+                        "max_injection_confidence for endpoint '{endpoint_path}' must be between 0.0 and 1.0, got {inj}"
+                    )));
+                }
+            }
+
+            if let Some(intent) = endpoint_rule.max_malicious_intent {
+                if !(0.0..=1.0).contains(&intent) || intent.is_nan() {
+                    return Err(PolicyError::ValidationError(format!(
+                        "max_malicious_intent for endpoint '{endpoint_path}' must be between 0.0 and 1.0, got {intent}"
+                    )));
+                }
+            }
+
+            if let Some(t) = endpoint_rule.model_timeout_ms {
+                if !(1..=60_000).contains(&t) {
+                    return Err(PolicyError::ValidationError(format!(
+                        "model_timeout_ms for endpoint '{endpoint_path}' must be between 1 and 60000, got {t}"
+                    )));
+                }
+            }
+
+            let compiled_constraints =
+                compile_constraints(endpoint_path, &endpoint_rule.constraints)?;
 
             compiled_endpoints.insert(
                 endpoint_path.clone(),
@@ -200,6 +344,62 @@ impl std::str::FromStr for PolicyEngine {
                     allowed_roles: endpoint_rule.allowed_roles.clone(),
                     required_args: endpoint_rule.required_args.clone(),
                     constraints: compiled_constraints,
+                    max_injection_confidence: endpoint_rule.max_injection_confidence,
+                    max_malicious_intent: endpoint_rule.max_malicious_intent,
+                    model_timeout_ms: endpoint_rule.model_timeout_ms,
+                },
+            );
+        }
+
+        // 4. Compile and validate tool rules
+        let mut compiled_tools = HashMap::with_capacity(config.tools.len());
+
+        for (tool_name, tool_rule) in &config.tools {
+            if tool_name.trim().is_empty() {
+                return Err(PolicyError::ValidationError(
+                    "tool name in [tools] must not be empty".to_string(),
+                ));
+            }
+
+            // Validate per-tool threshold overrides
+            if let Some(inj) = tool_rule.max_injection_confidence {
+                if !(0.0..=1.0).contains(&inj) || inj.is_nan() {
+                    return Err(PolicyError::ValidationError(format!(
+                        "max_injection_confidence for tool '{tool_name}' must be between 0.0 and 1.0, got {inj}"
+                    )));
+                }
+            }
+
+            if let Some(intent) = tool_rule.max_malicious_intent {
+                if !(0.0..=1.0).contains(&intent) || intent.is_nan() {
+                    return Err(PolicyError::ValidationError(format!(
+                        "max_malicious_intent for tool '{tool_name}' must be between 0.0 and 1.0, got {intent}"
+                    )));
+                }
+            }
+
+            if let Some(t) = tool_rule.model_timeout_ms {
+                if !(1..=60_000).contains(&t) {
+                    return Err(PolicyError::ValidationError(format!(
+                        "model_timeout_ms for tool '{tool_name}' must be between 1 and 60000, got {t}"
+                    )));
+                }
+            }
+
+            let tool_target_name = format!("tool:{tool_name}");
+            let compiled_constraints =
+                compile_constraints(&tool_target_name, &tool_rule.constraints)?;
+
+            compiled_tools.insert(
+                tool_name.clone(),
+                CompiledToolRule {
+                    enabled: tool_rule.enabled,
+                    allowed_roles: tool_rule.allowed_roles.clone(),
+                    required_args: tool_rule.required_args.clone(),
+                    constraints: compiled_constraints,
+                    max_injection_confidence: tool_rule.max_injection_confidence,
+                    max_malicious_intent: tool_rule.max_malicious_intent,
+                    model_timeout_ms: tool_rule.model_timeout_ms,
                 },
             );
         }
@@ -208,6 +408,7 @@ impl std::str::FromStr for PolicyEngine {
             config,
             compiled_endpoints,
             turn_rules,
+            compiled_tools,
         })
     }
 }
@@ -317,6 +518,71 @@ impl PolicyEngine {
             .map(|e| e.backend_url.as_str())
     }
 
+    /// Retrieves pre-compiled tool rule by exact name, falling back to case-insensitive match.
+    pub fn get_tool(&self, tool: &str) -> Option<&CompiledToolRule> {
+        self.compiled_tools.get(tool).or_else(|| {
+            self.compiled_tools
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(tool))
+                .map(|(_, v)| v)
+        })
+    }
+
+    /// Resolves effective (max_injection_confidence, max_malicious_intent) thresholds for an endpoint.
+    /// Falls back to global defaults if unlisted or override not specified.
+    pub fn effective_thresholds_for_endpoint(&self, endpoint: &str) -> (f32, f32) {
+        if let Some(rule) = self.compiled_endpoints.get(endpoint) {
+            let inj = rule
+                .max_injection_confidence
+                .unwrap_or(self.config.defaults.max_injection_confidence);
+            let intent = rule
+                .max_malicious_intent
+                .unwrap_or(self.config.defaults.max_malicious_intent);
+            (inj, intent)
+        } else {
+            (
+                self.config.defaults.max_injection_confidence,
+                self.config.defaults.max_malicious_intent,
+            )
+        }
+    }
+
+    /// Resolves effective model timeout in milliseconds for an endpoint.
+    /// Falls back to global defaults if unlisted or override not specified.
+    pub fn effective_timeout_for_endpoint(&self, endpoint: &str) -> u64 {
+        self.compiled_endpoints
+            .get(endpoint)
+            .and_then(|rule| rule.model_timeout_ms)
+            .unwrap_or(self.config.defaults.model_timeout_ms)
+    }
+
+    /// Resolves effective (max_injection_confidence, max_malicious_intent) thresholds for a tool.
+    /// Falls back to global defaults if unlisted or override not specified.
+    pub fn effective_thresholds_for_tool(&self, tool: &str) -> (f32, f32) {
+        if let Some(rule) = self.get_tool(tool) {
+            let inj = rule
+                .max_injection_confidence
+                .unwrap_or(self.config.defaults.max_injection_confidence);
+            let intent = rule
+                .max_malicious_intent
+                .unwrap_or(self.config.defaults.max_malicious_intent);
+            (inj, intent)
+        } else {
+            (
+                self.config.defaults.max_injection_confidence,
+                self.config.defaults.max_malicious_intent,
+            )
+        }
+    }
+
+    /// Resolves effective model timeout in milliseconds for a tool.
+    /// Falls back to global defaults if unlisted or override not specified.
+    pub fn effective_timeout_for_tool(&self, tool: &str) -> u64 {
+        self.get_tool(tool)
+            .and_then(|rule| rule.model_timeout_ms)
+            .unwrap_or(self.config.defaults.model_timeout_ms)
+    }
+
     /// Evaluates inbound tool execution request against deterministic zero-trust policy rules.
     ///
     /// Evaluation Priority Hierarchy (Strict 5-Step Order):
@@ -354,51 +620,86 @@ impl PolicyEngine {
             return Err(DenyRule::UnauthorizedRole);
         }
 
-        // Step 4: Required arguments presence and non-null validation
-        for req_arg in &endpoint_rule.required_args {
-            match req.payload.get(req_arg) {
-                Some(val) if !val.is_null() => {
-                    // Argument present and non-null
-                }
-                _ => return Err(DenyRule::MissingArg),
-            }
+        // Step 4 & 5: Required arguments and constraints validation
+        validate_payload_args_and_constraints(
+            &req.payload,
+            &endpoint_rule.required_args,
+            &endpoint_rule.constraints,
+        )
+    }
+
+    /// Evaluates local CLI tool execution against deterministic tool policy rules.
+    ///
+    /// Evaluation Priority Hierarchy:
+    /// 1. Tool allowlist & `enabled == true` -> `DenyRule::EndpointDenied`
+    /// 2. Caller role in `allowed_roles` -> `DenyRule::UnauthorizedRole`
+    /// 3. Required arguments non-null & present in payload -> `DenyRule::MissingArg`
+    /// 4. Argument constraints (max_len & linear-time regex) satisfied -> `DenyRule::ConstraintFailed`
+    pub fn evaluate_tool(
+        &self,
+        claims: &AgentClaims,
+        tool_name: &str,
+        payload: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), DenyRule> {
+        // Step 1: Tool allowlist and enabled check
+        let tool_rule = self.get_tool(tool_name).ok_or(DenyRule::EndpointDenied)?;
+
+        if !tool_rule.enabled {
+            return Err(DenyRule::EndpointDenied);
         }
 
-        // Step 5: Argument constraints validation (max_len and regex)
-        // Sort keys to guarantee deterministic order of constraint evaluation
-        let mut sorted_keys: Vec<_> = endpoint_rule.constraints.keys().collect();
-        sorted_keys.sort();
-
-        for arg_name in sorted_keys {
-            let constraint = &endpoint_rule.constraints[arg_name];
-
-            if let Some(val) = req.payload.get(arg_name) {
-                // If present and null, reject
-                if val.is_null() {
-                    return Err(DenyRule::ConstraintFailed);
-                }
-
-                // String constraints apply exclusively to string values;
-                // non-string types fail constraint validation.
-                let str_val = val.as_str().ok_or(DenyRule::ConstraintFailed)?;
-
-                // 5a. Maximum length constraint (Unicode character count)
-                if let Some(max_len) = constraint.max_len {
-                    if str_val.chars().count() > max_len {
-                        return Err(DenyRule::ConstraintFailed);
-                    }
-                }
-
-                // 5b. Linear-time Regex pattern matching
-                if let Some(re) = &constraint.regex {
-                    if !re.is_match(str_val) {
-                        return Err(DenyRule::ConstraintFailed);
-                    }
-                }
-            }
+        // Step 2: Caller role authorization against allowed_roles
+        let role_authorized = tool_rule.allowed_roles.iter().any(|r| r == &claims.role);
+        if !role_authorized {
+            return Err(DenyRule::UnauthorizedRole);
         }
 
-        Ok(())
+        // Step 3 & 4: Required arguments and constraints validation
+        validate_payload_args_and_constraints(
+            payload,
+            &tool_rule.required_args,
+            &tool_rule.constraints,
+        )
+    }
+
+    /// Convenience wrapper evaluating a tool execution where payload is provided as `serde_json::Value`.
+    /// Fails closed with `DenyRule::Malformed` if payload is not a JSON object.
+    pub fn evaluate_tool_value(
+        &self,
+        claims: &AgentClaims,
+        tool_name: &str,
+        payload_val: &serde_json::Value,
+    ) -> Result<(), DenyRule> {
+        let payload_map = payload_val.as_object().ok_or(DenyRule::Malformed)?;
+        self.evaluate_tool(claims, tool_name, payload_map)
+    }
+
+    /// Returns a reference to all configured agent CLI mappings.
+    pub fn cli_mappings(&self) -> &HashMap<String, AgentCliMapping> {
+        &self.config.agent_cli_mappings
+    }
+
+    /// Retrieves an individual CLI mapping by name (e.g. "claude", "codex", "ollama").
+    pub fn get_cli_mapping(&self, cli_name: &str) -> Option<&AgentCliMapping> {
+        self.config.agent_cli_mappings.get(cli_name)
+    }
+
+    /// Generates the process environment variable map needed to configure a target agent CLI.
+    pub fn get_cli_env(&self, cli_name: &str) -> Option<HashMap<String, String>> {
+        let mapping = self.config.agent_cli_mappings.get(cli_name)?;
+        let mut env = HashMap::new();
+        env.insert(mapping.env_var.clone(), mapping.sidecar_url.clone());
+        for (k, v) in &mapping.extra_env {
+            env.insert(k.clone(), v.clone());
+        }
+        Some(env)
+    }
+
+    /// Returns sorted list of all configured CLI mapping identifiers.
+    pub fn configured_clis(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.config.agent_cli_mappings.keys().cloned().collect();
+        names.sort();
+        names
     }
 }
 
@@ -958,5 +1259,396 @@ mod tests {
         );
         assert_eq!(engine.alerts(), &AlertPolicy::default());
         assert_eq!(engine.turn_rules().inline_tool_output.len(), 1);
+    }
+
+    #[test]
+    fn test_validation_model_timeout_bounds() {
+        // Zero timeout rejected
+        let bad_zero = r#"
+        [defaults]
+        model_timeout_ms = 0
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_zero),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        // Timeout > 60_000 rejected
+        let bad_large = r#"
+        [defaults]
+        model_timeout_ms = 60001
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_large),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        // Valid timeout in bounds accepted
+        let ok_timeout = r#"
+        [defaults]
+        model_timeout_ms = 2500
+        "#;
+        assert!(PolicyEngine::from_str(ok_timeout).is_ok());
+    }
+
+    #[test]
+    fn test_validation_nan_threshold_rejected() {
+        let bad_nan = r#"
+        [defaults]
+        max_injection_confidence = nan
+        "#;
+        assert!(PolicyEngine::from_str(bad_nan).is_err());
+    }
+
+    #[test]
+    fn test_validation_endpoint_path_requirements() {
+        // Missing leading slash rejected
+        let bad_path = r#"
+        [defaults]
+        [endpoints."api/v1/status"]
+        backend_url = "http://127.0.0.1:5000/api/v1/status"
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_path),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        // Empty endpoint path rejected
+        let bad_empty = r#"
+        [defaults]
+        [endpoints.""]
+        backend_url = "http://127.0.0.1:5000"
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_empty),
+            Err(PolicyError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn test_validation_backend_url_format_and_scheme() {
+        // Unparseable URL rejected
+        let bad_url = r#"
+        [defaults]
+        [endpoints."/api/status"]
+        backend_url = "not a valid url"
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_url),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        // Non-http/https scheme rejected (e.g. ftp)
+        let bad_scheme = r#"
+        [defaults]
+        [endpoints."/api/status"]
+        backend_url = "ftp://127.0.0.1:5000/api/status"
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_scheme),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        // Missing host rejected
+        let bad_host = r#"
+        [defaults]
+        [endpoints."/api/status"]
+        backend_url = "http://:8080/path"
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_host),
+            Err(PolicyError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn test_validation_endpoint_threshold_overrides_bounds() {
+        let bad_override = r#"
+        [defaults]
+        [endpoints."/api/v1/test"]
+        backend_url = "http://127.0.0.1:5000/api/v1/test"
+        max_malicious_intent = 1.2
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_override),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        let bad_override_timeout = r#"
+        [defaults]
+        [endpoints."/api/v1/test"]
+        backend_url = "http://127.0.0.1:5000/api/v1/test"
+        model_timeout_ms = 0
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_override_timeout),
+            Err(PolicyError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn test_validation_tool_rules_bounds_and_regex() {
+        // Empty tool name rejected
+        let bad_tool_name = r#"
+        [defaults]
+        [tools." "]
+        enabled = true
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_tool_name),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        // Invalid tool threshold rejected
+        let bad_tool_intent = r#"
+        [defaults]
+        [tools.bash]
+        max_malicious_intent = -0.5
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_tool_intent),
+            Err(PolicyError::ValidationError(_))
+        ));
+
+        // Invalid tool regex fails fast
+        let bad_tool_regex = r#"
+        [defaults]
+        [tools.bash]
+        constraints.command = { regex = "([a-z" }
+        "#;
+        assert!(matches!(
+            PolicyEngine::from_str(bad_tool_regex),
+            Err(PolicyError::InvalidRegex { .. })
+        ));
+    }
+
+    #[test]
+    fn test_effective_thresholds_resolution() {
+        let toml_policy = r#"
+        [defaults]
+        max_injection_confidence = 0.70
+        max_malicious_intent = 0.50
+        model_timeout_ms = 500
+
+        [endpoints."/api/v1/standard"]
+        backend_url = "http://127.0.0.1:5000/api/v1/standard"
+
+        [endpoints."/api/v1/sensitive"]
+        backend_url = "http://127.0.0.1:5000/api/v1/sensitive"
+        max_malicious_intent = 0.30
+        model_timeout_ms = 1200
+
+        [tools."bash"]
+        max_injection_confidence = 0.60
+        max_malicious_intent = 0.35
+        model_timeout_ms = 800
+
+        [tools."read_file"]
+        enabled = true
+        "#;
+
+        let engine = PolicyEngine::from_str(toml_policy).unwrap();
+
+        // Standard endpoint falls back to defaults
+        assert_eq!(
+            engine.effective_thresholds_for_endpoint("/api/v1/standard"),
+            (0.70, 0.50)
+        );
+        assert_eq!(
+            engine.effective_timeout_for_endpoint("/api/v1/standard"),
+            500
+        );
+
+        // Sensitive endpoint overrides intent and timeout
+        assert_eq!(
+            engine.effective_thresholds_for_endpoint("/api/v1/sensitive"),
+            (0.70, 0.30)
+        );
+        assert_eq!(
+            engine.effective_timeout_for_endpoint("/api/v1/sensitive"),
+            1200
+        );
+
+        // Unlisted endpoint falls back to defaults
+        assert_eq!(
+            engine.effective_thresholds_for_endpoint("/api/v1/unlisted"),
+            (0.70, 0.50)
+        );
+        assert_eq!(
+            engine.effective_timeout_for_endpoint("/api/v1/unlisted"),
+            500
+        );
+
+        // Bash tool overrides injection, intent, and timeout
+        assert_eq!(engine.effective_thresholds_for_tool("bash"), (0.60, 0.35));
+        assert_eq!(engine.effective_timeout_for_tool("bash"), 800);
+
+        // read_file tool falls back to defaults
+        assert_eq!(
+            engine.effective_thresholds_for_tool("read_file"),
+            (0.70, 0.50)
+        );
+        assert_eq!(engine.effective_timeout_for_tool("read_file"), 500);
+
+        // Case-insensitive tool lookup
+        assert_eq!(engine.effective_thresholds_for_tool("BASH"), (0.60, 0.35));
+    }
+
+    #[test]
+    fn test_evaluate_tool_priority_and_rules() {
+        let toml_policy = r#"
+        [defaults]
+
+        [tools."bash"]
+        enabled = true
+        allowed_roles = ["admin"]
+        required_args = ["command"]
+        constraints.command = { regex = "^[a-zA-Z0-9_./ -]+$", max_len = 100 }
+
+        [tools."disabled_tool"]
+        enabled = false
+        allowed_roles = ["admin"]
+        "#;
+
+        let engine = PolicyEngine::from_str(toml_policy).unwrap();
+        let claims_admin = test_claims("admin");
+        let claims_agent = test_claims("agent");
+
+        // Priority 1: Unlisted or disabled tool -> EndpointDenied
+        let res_unlisted = engine.evaluate_tool(
+            &claims_admin,
+            "nonexistent",
+            json!({"command": "ls"}).as_object().unwrap(),
+        );
+        assert_eq!(res_unlisted, Err(DenyRule::EndpointDenied));
+
+        let res_disabled = engine.evaluate_tool(
+            &claims_admin,
+            "disabled_tool",
+            json!({}).as_object().unwrap(),
+        );
+        assert_eq!(res_disabled, Err(DenyRule::EndpointDenied));
+
+        // Priority 2: Unauthorized role -> UnauthorizedRole
+        let res_unauth = engine.evaluate_tool(
+            &claims_agent,
+            "bash",
+            json!({"command": "ls"}).as_object().unwrap(),
+        );
+        assert_eq!(res_unauth, Err(DenyRule::UnauthorizedRole));
+
+        // Priority 3: Missing required argument -> MissingArg
+        let res_missing =
+            engine.evaluate_tool(&claims_admin, "bash", json!({}).as_object().unwrap());
+        assert_eq!(res_missing, Err(DenyRule::MissingArg));
+
+        let res_null_arg = engine.evaluate_tool(
+            &claims_admin,
+            "bash",
+            json!({"command": null}).as_object().unwrap(),
+        );
+        assert_eq!(res_null_arg, Err(DenyRule::MissingArg));
+
+        // Priority 4: Constraint failed (regex) -> ConstraintFailed
+        let res_bad_regex = engine.evaluate_tool(
+            &claims_admin,
+            "bash",
+            json!({"command": "cat secret; rm -rf /"})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(res_bad_regex, Err(DenyRule::ConstraintFailed));
+
+        // Priority 4: Constraint failed (length) -> ConstraintFailed
+        let long_cmd = "a".repeat(101);
+        let res_too_long = engine.evaluate_tool(
+            &claims_admin,
+            "bash",
+            json!({"command": long_cmd}).as_object().unwrap(),
+        );
+        assert_eq!(res_too_long, Err(DenyRule::ConstraintFailed));
+
+        // Approved tool call -> Ok(())
+        let res_ok = engine.evaluate_tool(
+            &claims_admin,
+            "bash",
+            json!({"command": "ls -la"}).as_object().unwrap(),
+        );
+        assert_eq!(res_ok, Ok(()));
+
+        // Case-insensitive tool name matching -> Ok(())
+        let res_ci = engine.evaluate_tool(
+            &claims_admin,
+            "BASH",
+            json!({"command": "pwd"}).as_object().unwrap(),
+        );
+        assert_eq!(res_ci, Ok(()));
+    }
+
+    #[test]
+    fn test_evaluate_tool_value_and_malformed() {
+        let toml_policy = r#"
+        [defaults]
+        [tools."bash"]
+        enabled = true
+        allowed_roles = ["admin"]
+        required_args = ["command"]
+        "#;
+        let engine = PolicyEngine::from_str(toml_policy).unwrap();
+        let claims = test_claims("admin");
+
+        // Non-object payload -> Malformed
+        let bad_payload = json!("not an object");
+        assert_eq!(
+            engine.evaluate_tool_value(&claims, "bash", &bad_payload),
+            Err(DenyRule::Malformed)
+        );
+
+        // Valid object payload -> Ok
+        let good_payload = json!({"command": "uptime"});
+        assert_eq!(
+            engine.evaluate_tool_value(&claims, "bash", &good_payload),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_cli_mappings_accessors() {
+        let toml_policy = r#"
+        [defaults]
+
+        [agent_cli_mappings.claude]
+        env_var = "ANTHROPIC_BASE_URL"
+        api_key_env_var = "ANTHROPIC_API_KEY"
+        sidecar_url = "http://127.0.0.1:8080"
+        upstream_url = "https://api.anthropic.com/v1/messages"
+        protocol = "anthropic"
+        extra_env = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+
+        [agent_cli_mappings.ollama]
+        env_var = "OLLAMA_HOST"
+        sidecar_url = "127.0.0.1:8080"
+        "#;
+
+        let engine = PolicyEngine::from_str(toml_policy).unwrap();
+        assert_eq!(engine.cli_mappings().len(), 2);
+        assert_eq!(engine.configured_clis(), vec!["claude", "ollama"]);
+
+        let claude = engine.get_cli_mapping("claude").unwrap();
+        assert_eq!(claude.env_var, "ANTHROPIC_BASE_URL");
+        assert_eq!(claude.api_key_env_var.as_deref(), Some("ANTHROPIC_API_KEY"));
+
+        let env = engine.get_cli_env("claude").unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").unwrap(),
+            "1"
+        );
+
+        assert!(engine.get_cli_mapping("nonexistent").is_none());
+        assert!(engine.get_cli_env("nonexistent").is_none());
     }
 }

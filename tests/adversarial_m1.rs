@@ -729,7 +729,10 @@ mod config_edge_case_tests {
 
         for ws in whitespace_variants {
             // Empty SIDECAR_SECRET
-            let vars = [("SIDECAR_SECRET", ws), ("JWT_SECRET", "valid-jwt-key")];
+            let vars = [
+                ("SIDECAR_SECRET", ws),
+                ("JWT_SECRET", "valid-jwt-secret-16b"),
+            ];
             let err = Config::from_vars(vars).unwrap_err();
             assert_eq!(err, ConfigError::EmptyVar("SIDECAR_SECRET"));
 
@@ -757,8 +760,8 @@ mod config_edge_case_tests {
 
         for addr in invalid_addrs {
             let vars = [
-                ("SIDECAR_SECRET", "secret1"),
-                ("JWT_SECRET", "secret2"),
+                ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+                ("JWT_SECRET", "valid-jwt-secret-16b"),
                 ("SIDECAR_ADDR", addr),
             ];
             let err = Config::from_vars(vars).unwrap_err();
@@ -785,8 +788,8 @@ mod config_edge_case_tests {
 
         for addr in valid_addrs {
             let vars = [
-                ("SIDECAR_SECRET", "secret1"),
-                ("JWT_SECRET", "secret2"),
+                ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+                ("JWT_SECRET", "valid-jwt-secret-16b"),
                 ("SIDECAR_ADDR", addr),
             ];
             let cfg = Config::from_vars(vars);
@@ -804,7 +807,7 @@ mod config_edge_case_tests {
         let large_secret = "a".repeat(65536);
         let vars = [
             ("SIDECAR_SECRET", large_secret.as_str()),
-            ("JWT_SECRET", "jwt-secret"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
         ];
         let cfg = Config::from_vars(vars).unwrap();
         assert_eq!(cfg.sidecar_secret.len(), 65536);
@@ -813,7 +816,7 @@ mod config_edge_case_tests {
         let unicode_secret = "🔑安全密钥-sidecar-🚀";
         let vars = [
             ("SIDECAR_SECRET", unicode_secret),
-            ("JWT_SECRET", "jwt-secret"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
         ];
         let cfg = Config::from_vars(vars).unwrap();
         assert_eq!(cfg.sidecar_secret, unicode_secret);
@@ -843,7 +846,10 @@ mod config_edge_case_tests {
         ];
 
         for (input, expected) in test_cases {
-            let mut vars = vec![("SIDECAR_SECRET", "sec1"), ("JWT_SECRET", "sec2")];
+            let mut vars = vec![
+                ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+                ("JWT_SECRET", "valid-jwt-secret-16b"),
+            ];
             if let Some(key) = input {
                 vars.push(("ANTHROPIC_API_KEY", key));
             }

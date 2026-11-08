@@ -108,9 +108,10 @@ pub async fn forward(
         Ok(resp) => resp,
         Err(err) => {
             tracing::debug!(error = %err, %url, "UP upstream unreachable -> 502");
-            let body = AnthropicErrorEnvelope::api_error(format!(
+            let mut body = AnthropicErrorEnvelope::api_error(format!(
                 "Upstream Anthropic connection failure: {err}"
             ));
+            body.sanitize(state.audit_logger.known_secrets());
             return (
                 StatusCode::BAD_GATEWAY,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -134,6 +135,25 @@ pub async fn forward(
         ) {
             response_headers.append(name, value);
         }
+    }
+    if !status.is_success() {
+        // Error bodies are small: buffer them and scrub reflected credentials before relaying.
+        let bytes = upstream.bytes().await.unwrap_or_default();
+        let scrubbed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(mut value) => {
+                state.audit_logger.redact_value(&mut value);
+                serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec())
+            }
+            Err(_) => state
+                .audit_logger
+                .redact_string(&String::from_utf8_lossy(&bytes))
+                .into_bytes(),
+        };
+        tracing::debug!(status = status.as_u16(), %url, "UP upstream error; relaying scrubbed body");
+        let mut response = Response::new(Body::from(scrubbed));
+        *response.status_mut() = status;
+        *response.headers_mut() = response_headers;
+        return response;
     }
     let is_sse = response_headers
         .get(header::CONTENT_TYPE)

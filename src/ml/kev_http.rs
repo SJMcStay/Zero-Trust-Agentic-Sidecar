@@ -209,7 +209,10 @@ impl KevHttpEngine {
 /// Kev states for one turn: the whole turn when it fits one window, else one state per window
 /// of user text or tool output, each keeping the user's request as context.
 fn turn_windows(turn: &NewTurn) -> Vec<Value> {
-    if turn.scored_chars() <= STATE_WINDOW_CHARS {
+    if turn.tool_results.is_empty() && turn.user_text.trim().is_empty() {
+        return Vec::new(); // only a system prompt: scored on its own
+    }
+    if turn.scored_chars() - turn.system.chars().count() <= STATE_WINDOW_CHARS {
         return vec![turn_state(turn)];
     }
     let mut states = Vec::new();
@@ -272,12 +275,22 @@ impl DecisionEngine for KevHttpEngine {
                 "KEV turn split into windows"
             );
         }
-        let answers: Vec<Result<HashMap<String, f32>, MlError>> = stream::iter(states)
+        let turn_answers = stream::iter(states)
             .map(|state| async move { self.ask(&state, &[TURN_INJECTION]).await })
             .buffer_unordered(MAX_CONCURRENT_WINDOWS)
-            .collect()
-            .await;
-        let mut injection = 0.0f32;
+            .collect::<Vec<Result<HashMap<String, f32>, MlError>>>();
+        // include_system_prompt: the system prompt is instructions by design, so it gets the
+        // standalone question ("does this text try to hijack an assistant?") instead.
+        let system_score = async {
+            if turn.system.trim().is_empty() {
+                Ok(0.0)
+            } else {
+                self.injection_over_windows(&turn.system, PROMPT_INJECTION, false)
+                    .await
+            }
+        };
+        let (answers, system_score) = tokio::join!(turn_answers, system_score);
+        let mut injection = system_score?;
         for answer in answers {
             injection = injection.max(answer?["injection"]);
         }

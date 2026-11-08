@@ -80,6 +80,10 @@ impl AnthropicErrorEnvelope {
             },
         }
     }
+    /// Removes known secrets, API keys and bearer tokens from the message.
+    pub fn sanitize(&mut self, known_secrets: &[String]) {
+        self.error.message = crate::audit::redact_string(&self.error.message, known_secrets);
+    }
 }
 
 /// Extracts full prompt text across system instructions and conversation messages.
@@ -331,8 +335,8 @@ pub async fn messages_handler(
         }
     };
 
+    // Route A asks only "is this injected?"; whether an action is harmful is Route B's question.
     let max_injection = policy.defaults().max_injection_confidence;
-    let max_intent = policy.defaults().max_malicious_intent;
     let new_turn = match &scored {
         Scored::New(turn) => Some(turn),
         Scored::All(_) => None,
@@ -350,7 +354,7 @@ pub async fn messages_handler(
             ),
             verdict: None,
         }),
-        Ok(v) if v.injection_confidence >= max_injection || v.malicious_intent >= max_intent => {
+        Ok(v) if v.injection_confidence >= max_injection => {
             let source = new_turn
                 .map(describe_sources)
                 .unwrap_or_else(|| "the prompt".to_string());
@@ -367,11 +371,7 @@ pub async fn messages_handler(
             })
         }
         Ok(v) => {
-            tracing::debug!(
-                max_injection,
-                max_intent,
-                "A4 allow: scores below thresholds"
-            );
+            tracing::debug!(max_injection, "A4 allow: injection score below threshold");
             audit(&state, start_time, "allow", None, None, Some(&v));
             None
         }
@@ -448,7 +448,8 @@ fn malformed(state: &AppState, start_time: Instant, message: String) -> Response
         Some(message.clone()),
         None,
     );
-    let err = AnthropicErrorEnvelope::invalid_request_error(message);
+    let mut err = AnthropicErrorEnvelope::invalid_request_error(message);
+    err.sanitize(state.audit_logger.known_secrets());
     (
         StatusCode::BAD_REQUEST,
         [(header::CONTENT_TYPE, "application/json")],
@@ -470,6 +471,8 @@ fn blocked(
     turn: Option<&NewTurn>,
 ) -> Response {
     tracing::debug!(rule = ?block.rule, reason = %block.reason, on_block = ?route_a.on_block, "A4 deny");
+    let explanation =
+        crate::audit::redact_string(&block.explanation, state.audit_logger.known_secrets());
     audit(
         state,
         start_time,
@@ -484,7 +487,7 @@ fn blocked(
         }
     }
     if policy.alerts().desktop {
-        alerts::desktop("Zero-Trust Sidecar blocked a request", &block.explanation);
+        alerts::desktop("Zero-Trust Sidecar blocked a request", &explanation);
     }
     match route_a.on_block {
         BlockResponse::Error => {
@@ -496,7 +499,7 @@ fn blocked(
             )
                 .into_response()
         }
-        BlockResponse::Message => assistant_message(model, stream, &block.explanation),
+        BlockResponse::Message => assistant_message(model, stream, &explanation),
     }
 }
 

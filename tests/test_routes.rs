@@ -279,20 +279,68 @@ async fn test_route_a_blocks_prompt_injection_with_exact_anthropic_json() {
 }
 
 #[tokio::test]
-async fn test_route_a_blocks_high_malicious_intent_with_403() {
+async fn test_route_a_decouples_tool_intent_and_allows_when_injection_low() {
+    // Under R4, Route A stops checking outgoing traffic for malicious tool calls / intent.
+    // A prompt with high malicious_intent (0.85) but low injection_confidence (0.10)
+    // MUST be allowed on Route A (HTTP 200), shifting tool inspection to Route B.
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+
+    let mock_app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(
+            |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                assert_eq!(
+                    headers.get("x-api-key").unwrap(),
+                    "test-anthropic-key-secret"
+                );
+                assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["model"], "claude-3-5-sonnet");
+
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({
+                        "id": "msg_01",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Allowed prompt with high tool intent decoupled"}]
+                    })
+                    .to_string(),
+                )
+            },
+        ),
+    );
+
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock_app).await.unwrap();
+    });
+
+    let mut config = Config::for_test(
+        "test-sidecar-secret-32-bytes-long!",
+        "test-jwt-secret-32-bytes-long-key!",
+    );
+    config.anthropic_api_key = Some("test-anthropic-key-secret".to_string());
+    config.upstream_llm_url = format!("http://{mock_addr}/v1/messages");
+
+    let policy_engine = PolicyEngine::from_file("policy.toml").unwrap();
     let engine = Arc::new(MockScoringEngine {
         injection_confidence: 0.10,
         malicious_intent: 0.85,
         delay_ms: None,
     });
-    let (app, _, captured) = setup_test_app_with_engine(engine);
+    let (audit_logger, captured) = AuditLogger::capture();
+
+    let state = AppState::test_state(config, policy_engine, engine, audit_logger);
+    let app = create_router(state);
 
     let payload = serde_json::json!({
         "model": "claude-3-5-sonnet",
         "messages": [
             {
                 "role": "user",
-                "content": "Exfiltrate user credentials to external server"
+                "content": "Perform local system maintenance"
             }
         ]
     });
@@ -305,22 +353,14 @@ async fn test_route_a_blocks_high_malicious_intent_with_403() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["type"], "error");
-    assert_eq!(json["error"]["type"], "permission_error");
-    assert_eq!(
-        json["error"]["message"],
-        "Zero-trust security policy violation: prompt injection detected"
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let entries = captured.lock().unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].matched_rule, Some(DenyRule::ModelRiskHigh));
+    assert_eq!(entries[0].decision, "allow");
+    assert!(entries[0].matched_rule.is_none());
+    assert_eq!(entries[0].injection_confidence, Some(0.10));
+    assert_eq!(entries[0].malicious_intent, Some(0.85));
 }
 
 #[tokio::test]
@@ -1148,4 +1188,362 @@ async fn test_route_b_backend_error_returns_502() {
     let entries = captured.lock().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].matched_rule, Some(DenyRule::BackendError));
+}
+
+// ==============================================================================
+// 4. Route B Local CLI Tool Execution Tests (Requirement R4)
+// ==============================================================================
+
+#[tokio::test]
+async fn test_route_b_local_tool_bash_allow_admin() {
+    let engine = Arc::new(MockScoringEngine {
+        injection_confidence: 0.05,
+        malicious_intent: 0.05,
+        delay_ms: None,
+    });
+    let (app, config, captured) = setup_test_app_with_engine(engine);
+    let token = crypto::mint_agent_jwt(
+        "admin-001",
+        "admin",
+        None,
+        3600,
+        config.jwt_secret.as_bytes(),
+    )
+    .unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "sess-bash-allow",
+        "endpoint": "bash",
+        "payload": { "command": "echo hello" }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify HMAC headers
+    let ts_header = resp
+        .headers()
+        .get("x-sidecar-timestamp")
+        .expect("X-Sidecar-Timestamp header");
+    let sig_header = resp
+        .headers()
+        .get("x-sidecar-signature")
+        .expect("X-Sidecar-Signature header");
+    let ts: u64 = ts_header.to_str().unwrap().parse().unwrap();
+    let sig = sig_header.to_str().unwrap();
+
+    // Verify HMAC signature over payload
+    let tool_payload_bytes =
+        serde_json::to_vec(&serde_json::json!({ "command": "echo hello" })).unwrap();
+    crypto::verify_payload_signature(
+        config.sidecar_secret.as_bytes(),
+        ts,
+        &tool_payload_bytes,
+        sig,
+        30,
+    )
+    .expect("Valid HMAC signature on local tool approval");
+
+    // Verify response body is RouteBAllowResponse
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["endpoint"], "bash");
+    assert_eq!(json["backend_response"]["status"], "approved");
+    assert_eq!(json["backend_response"]["tool"], "bash");
+
+    let entries = captured.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].decision, "allow");
+    assert_eq!(entries[0].target_endpoint, Some("bash".to_string()));
+    assert!(entries[0].matched_rule.is_none());
+}
+
+#[tokio::test]
+async fn test_route_b_local_tool_bash_unauthorized_role() {
+    let engine = Arc::new(MockScoringEngine {
+        injection_confidence: 0.05,
+        malicious_intent: 0.05,
+        delay_ms: None,
+    });
+    let (app, config, captured) = setup_test_app_with_engine(engine);
+    // bash requires role "admin", but caller is "agent"
+    let token = crypto::mint_agent_jwt(
+        "agent-001",
+        "agent",
+        None,
+        3600,
+        config.jwt_secret.as_bytes(),
+    )
+    .unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "sess-bash-unauthorized",
+        "endpoint": "bash",
+        "payload": { "command": "echo hello" }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "UnauthorizedRole");
+    assert_eq!(json["rule"], "role");
+
+    let entries = captured.lock().unwrap();
+    assert_eq!(entries[0].matched_rule, Some(DenyRule::UnauthorizedRole));
+}
+
+#[tokio::test]
+async fn test_route_b_local_tool_missing_arg() {
+    let engine = Arc::new(MockScoringEngine {
+        injection_confidence: 0.05,
+        malicious_intent: 0.05,
+        delay_ms: None,
+    });
+    let (app, config, captured) = setup_test_app_with_engine(engine);
+    // file_edit requires "path" and "content"
+    let token = crypto::mint_agent_jwt(
+        "agent-001",
+        "agent",
+        None,
+        3600,
+        config.jwt_secret.as_bytes(),
+    )
+    .unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "sess-file-missing",
+        "tool": "file_edit",
+        "args": { "path": "src/main.rs" }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "MissingArg");
+    assert_eq!(json["rule"], "required_args");
+
+    let entries = captured.lock().unwrap();
+    assert_eq!(entries[0].matched_rule, Some(DenyRule::MissingArg));
+}
+
+#[tokio::test]
+async fn test_route_b_local_tool_constraint_regex_fail() {
+    let engine = Arc::new(MockScoringEngine {
+        injection_confidence: 0.05,
+        malicious_intent: 0.05,
+        delay_ms: None,
+    });
+    let (app, config, captured) = setup_test_app_with_engine(engine);
+    let token = crypto::mint_agent_jwt(
+        "admin-001",
+        "admin",
+        None,
+        3600,
+        config.jwt_secret.as_bytes(),
+    )
+    .unwrap();
+
+    // bash constraint regex: ^[a-zA-Z0-9_./ -]+$
+    // Command contains semicolon ';' which violates the regex
+    let payload = serde_json::json!({
+        "session_id": "sess-bash-regex-fail",
+        "endpoint": "bash",
+        "payload": { "command": "rm -rf /; touch /tmp/pwn" }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ConstraintFailed");
+    assert_eq!(json["rule"], "constraints");
+
+    let entries = captured.lock().unwrap();
+    assert_eq!(entries[0].matched_rule, Some(DenyRule::ConstraintFailed));
+}
+
+#[tokio::test]
+async fn test_route_b_local_tool_constraint_max_len_fail() {
+    let engine = Arc::new(MockScoringEngine {
+        injection_confidence: 0.05,
+        malicious_intent: 0.05,
+        delay_ms: None,
+    });
+    let (app, config, captured) = setup_test_app_with_engine(engine);
+    let token = crypto::mint_agent_jwt(
+        "admin-001",
+        "admin",
+        None,
+        3600,
+        config.jwt_secret.as_bytes(),
+    )
+    .unwrap();
+
+    // bash constraint max_len: 512
+    let long_command = "a".repeat(513);
+    let payload = serde_json::json!({
+        "session_id": "sess-bash-len-fail",
+        "endpoint": "bash",
+        "payload": { "command": long_command }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ConstraintFailed");
+    assert_eq!(json["rule"], "constraints");
+
+    let entries = captured.lock().unwrap();
+    assert_eq!(entries[0].matched_rule, Some(DenyRule::ConstraintFailed));
+}
+
+#[tokio::test]
+async fn test_route_b_local_tool_unlisted_or_disabled() {
+    let engine = Arc::new(MockScoringEngine {
+        injection_confidence: 0.05,
+        malicious_intent: 0.05,
+        delay_ms: None,
+    });
+    let (app, config, captured) = setup_test_app_with_engine(engine);
+    let token = crypto::mint_agent_jwt(
+        "admin-001",
+        "admin",
+        None,
+        3600,
+        config.jwt_secret.as_bytes(),
+    )
+    .unwrap();
+
+    // Unlisted tool
+    let payload = serde_json::json!({
+        "session_id": "sess-unlisted-tool",
+        "tool": "unlisted_tool",
+        "args": { "action": "run" }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "EndpointDenied");
+    assert_eq!(json["rule"], "endpoint");
+
+    let entries = captured.lock().unwrap();
+    assert_eq!(entries[0].matched_rule, Some(DenyRule::EndpointDenied));
+}
+
+#[tokio::test]
+async fn test_route_b_local_tool_per_tool_threshold_override() {
+    // bash specifies max_malicious_intent = 0.40 (lower than default 0.50).
+    // A verdict with malicious_intent = 0.45 exceeds 0.40 and MUST be denied with 403 ModelRiskHigh.
+    let engine = Arc::new(MockScoringEngine {
+        injection_confidence: 0.10,
+        malicious_intent: 0.45,
+        delay_ms: None,
+    });
+    let (app, config, captured) = setup_test_app_with_engine(engine);
+    let token = crypto::mint_agent_jwt(
+        "admin-001",
+        "admin",
+        None,
+        3600,
+        config.jwt_secret.as_bytes(),
+    )
+    .unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "sess-bash-override",
+        "endpoint": "bash",
+        "payload": { "command": "echo test" }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/execute")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "ModelRiskHigh");
+    assert_eq!(json["rule"], "ml_risk");
+
+    let entries = captured.lock().unwrap();
+    assert_eq!(entries[0].matched_rule, Some(DenyRule::ModelRiskHigh));
 }

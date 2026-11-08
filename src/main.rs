@@ -40,11 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "startup config (secrets never printed)"
     );
 
-    // 3. Initialize structured JSONL audit logger with secret redaction
-    let audit_logger = Arc::new(AuditLogger::from_config(&config));
-    tracing::info!("Structured audit logger initialized");
-
-    // 4. Load deterministic policy configuration from TOML
+    // 3. Load deterministic policy configuration from TOML
     let policy_engine = match PolicyEngine::from_file(&config.policy_path) {
         Ok(engine) => Arc::new(engine),
         Err(err) => {
@@ -59,6 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Deterministic policy engine loaded from {:?}",
         config.policy_path
     );
+
+    // 4. Initialize structured JSONL audit logger with secret redaction (including CLI mapping keys)
+    let mut audit_logger_inst = AuditLogger::from_config(&config);
+    audit_logger_inst.register_cli_mapping_secrets_from_env(&policy_engine);
+    let audit_logger = Arc::new(audit_logger_inst);
+    tracing::info!("Structured audit logger initialized");
     let d = policy_engine.defaults();
     tracing::debug!(
         max_injection = d.max_injection_confidence,
