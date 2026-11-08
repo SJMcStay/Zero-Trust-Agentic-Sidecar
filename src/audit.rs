@@ -169,6 +169,39 @@ impl AuditLogger {
         self.add_secret(&config.jwt_secret);
     }
 
+    /// Automatically registers all API keys configured in agent CLI mappings from process environment.
+    pub fn register_cli_mapping_secrets_from_env(&mut self, policy: &crate::policy::PolicyEngine) {
+        self.register_cli_mapping_secrets(policy, |var| std::env::var(var).ok());
+    }
+
+    /// Automatically registers all API keys configured in agent CLI mappings from an arbitrary resolver.
+    pub fn register_cli_mapping_secrets<F>(
+        &mut self,
+        policy: &crate::policy::PolicyEngine,
+        mut var_resolver: F,
+    ) where
+        F: FnMut(&str) -> Option<String>,
+    {
+        for mapping in policy.cli_mappings().values() {
+            if let Some(key_var) = &mapping.api_key_env_var {
+                if let Some(val) = var_resolver(key_var) {
+                    let trimmed = val.trim();
+                    if !trimmed.is_empty() && trimmed.len() >= 4 {
+                        self.add_secret(trimmed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Factory method initializing AuditLogger from both Config and PolicyEngine.
+    pub fn from_config_and_policy(config: &Config, policy: &crate::policy::PolicyEngine) -> Self {
+        let mut logger = Self::stdout();
+        logger.register_config_secrets(config);
+        logger.register_cli_mapping_secrets_from_env(policy);
+        logger
+    }
+
     /// Sanitizes and logs an audit entry to the configured destination sink.
     pub fn log(&self, mut entry: AuditEntry) -> Result<(), AuditError> {
         entry.sanitize(&self.known_secrets);
@@ -238,6 +271,21 @@ impl AuditLogger {
         self.clear();
     }
 
+    /// Returns slice of all registered known secrets.
+    pub fn known_secrets(&self) -> &[String] {
+        &self.known_secrets
+    }
+
+    /// Redacts all known secrets, API keys, tokens, and sensitive patterns from text.
+    pub fn redact_string(&self, input: &str) -> String {
+        redact_string(input, &self.known_secrets)
+    }
+
+    /// Recursively traverses a JSON Value, redacting sensitive keys and scrubbing all string leaves.
+    pub fn redact_value(&self, value: &mut serde_json::Value) {
+        redact_value(value, &self.known_secrets);
+    }
+
     /// Formats an `AuditEntry` as a single-line JSONL string terminating in `\n`.
     pub fn format_jsonl(&self, entry: &AuditEntry) -> Result<String, AuditError> {
         let mut json = serde_json::to_string(entry)?;
@@ -300,8 +348,9 @@ pub fn redact_sensitive_text(input: &str) -> String {
     redact_string(input, &[])
 }
 
-/// Recursively traverses a JSON Value and masks values of sensitive keys.
-pub fn redact_json_value(value: &mut serde_json::Value) {
+/// Recursively traverses a JSON Value, masking values of sensitive keys
+/// and scrubbing all string values against known secrets and sensitive patterns.
+pub fn redact_value(value: &mut serde_json::Value, known_secrets: &[String]) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, val) in map.iter_mut() {
@@ -317,17 +366,25 @@ pub fn redact_json_value(value: &mut serde_json::Value) {
                 {
                     *val = serde_json::Value::String("[REDACTED]".to_string());
                 } else {
-                    redact_json_value(val);
+                    redact_value(val, known_secrets);
                 }
             }
         }
         serde_json::Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_json_value(item);
+                redact_value(item, known_secrets);
             }
+        }
+        serde_json::Value::String(s) => {
+            *s = redact_string(s, known_secrets);
         }
         _ => {}
     }
+}
+
+/// Backward-compatible wrapper for `redact_value` without custom known secrets.
+pub fn redact_json_value(value: &mut serde_json::Value) {
+    redact_value(value, &[]);
 }
 
 impl AuditEntry {
@@ -359,6 +416,7 @@ mod tests {
     use super::*;
     use crate::types::DenyRule;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn sample_allow_entry() -> AuditEntry {
         AuditEntry {
@@ -731,5 +789,91 @@ mod tests {
         let res = logger.log(sample_allow_entry());
         assert!(res.is_ok());
         assert_eq!(logger.entries().len(), 1);
+    }
+
+    #[test]
+    fn test_audit_logger_register_cli_mapping_secrets() {
+        let toml_policy = r#"
+        [defaults]
+        [agent_cli_mappings.claude]
+        env_var = "ANTHROPIC_BASE_URL"
+        api_key_env_var = "ANTHROPIC_API_KEY"
+        sidecar_url = "http://127.0.0.1:8080"
+
+        [agent_cli_mappings.codex]
+        env_var = "OPENAI_BASE_URL"
+        api_key_env_var = "OPENAI_API_KEY"
+        sidecar_url = "http://127.0.0.1:8080/v1"
+        "#;
+        let policy = crate::policy::PolicyEngine::from_str(toml_policy).unwrap();
+
+        let mut logger = AuditLogger::buffered();
+        let mock_env = HashMap::from([
+            (
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-ant-secret-123456".to_string(),
+            ),
+            (
+                "OPENAI_API_KEY".to_string(),
+                "sk-proj-openai-secret-abcdef".to_string(),
+            ),
+        ]);
+
+        logger.register_cli_mapping_secrets(&policy, |var| mock_env.get(var).cloned());
+
+        let mut entry = sample_allow_entry();
+        entry.reason = Some(
+            "Failure connecting with sk-ant-secret-123456 and sk-proj-openai-secret-abcdef"
+                .to_string(),
+        );
+        logger.log(entry).unwrap();
+
+        let logged = logger.entries();
+        assert_eq!(logged.len(), 1);
+        let logged_reason = logged[0].reason.as_ref().unwrap();
+        assert!(!logged_reason.contains("sk-ant-secret-123456"));
+        assert!(!logged_reason.contains("sk-proj-openai-secret-abcdef"));
+        assert!(logged_reason.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_value_nested_string_leaves_known_secrets_and_patterns() {
+        let known = vec!["registered-custom-secret-999".to_string()];
+        let mut val = json!({
+            "status": "error",
+            "message": "Encountered registered-custom-secret-999 during processing",
+            "metadata": {
+                "auth_header": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.signature",
+                "description": "Key is sk-ant-api03-1234567890abcdef1234567890abcdef here",
+                "nested_jwt": "Token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozS6-m_WvQ",
+                "nested_hex": "Checksum 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef matched",
+                "safe_info": "safe text"
+            },
+            "array_items": [
+                "plain text",
+                "leak: registered-custom-secret-999",
+                {"in_array_obj": "Bearer token1234567890"}
+            ],
+            "password": "should-be-masked-by-key"
+        });
+
+        redact_value(&mut val, &known);
+
+        assert_eq!(val["message"], "Encountered [REDACTED] during processing");
+        assert_eq!(val["metadata"]["auth_header"], "Bearer [REDACTED]");
+        assert_eq!(
+            val["metadata"]["description"],
+            "Key is [REDACTED_API_KEY] here"
+        );
+        assert_eq!(val["metadata"]["nested_jwt"], "Token [REDACTED_JWT]");
+        assert_eq!(
+            val["metadata"]["nested_hex"],
+            "Checksum [REDACTED_HEX] matched"
+        );
+        assert_eq!(val["metadata"]["safe_info"], "safe text");
+        assert_eq!(val["array_items"][0], "plain text");
+        assert_eq!(val["array_items"][1], "leak: [REDACTED]");
+        assert_eq!(val["array_items"][2]["in_array_obj"], "Bearer [REDACTED]");
+        assert_eq!(val["password"], "[REDACTED]");
     }
 }
