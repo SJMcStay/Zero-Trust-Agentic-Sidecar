@@ -34,12 +34,21 @@ else
 import re, sys
 model, sidecar, jwt = sys.argv[1:]
 env = open(".env.example").read()
-for key, value in {"SIDECAR_SECRET": sidecar, "JWT_SECRET": jwt, "KEV_MODEL": model}.items():
+values = {"SIDECAR_SECRET": sidecar, "JWT_SECRET": jwt, "KEV_MODEL": model, "POLICY_PATH": "policy.local.toml"}
+for key, value in values.items():
     env = re.sub(rf"^{key}=.*$", f"{key}={value}", env, flags=re.M)
 open(".env", "w").write(env)
 EOF
   chmod 600 .env
   echo "wrote .env (set ANTHROPIC_API_KEY in it for Route A)"
+fi
+
+step "policy.local.toml (real-model timeout; policy.toml keeps 500 ms for the tests)"
+if [ -f policy.local.toml ]; then
+  echo "policy.local.toml exists; leaving it"
+else
+  sed 's/^model_timeout_ms = .*/model_timeout_ms = 5000/' policy.toml > policy.local.toml
+  echo "wrote policy.local.toml (model_timeout_ms = 5000; raise it if you see model_unavailable)"
 fi
 
 step "Model weights ($KEV_MODEL, pinned + sha256-verified)"

@@ -74,6 +74,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Local policy with the real-model timeout (scripts/init.sh)
+policy.local.toml
+
 # Runtime logs / audit output (may contain captured prompts + payloads)
 *.log
 /logs/
