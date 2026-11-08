@@ -33,7 +33,9 @@ use crate::{
     crypto::{self, HEADER_SIGNATURE, HEADER_TIMESTAMP},
     policy::PolicyEngine,
     routes::AppState,
-    types::{AgentClaims, AuditEntry, DenyRule, KevScores, ToolExecuteRequest},
+    types::{
+        AgentClaims, AuditEntry, DenyRule, KevScores, RouteBAllowResponse, ToolExecuteRequest,
+    },
 };
 
 /// Unified error response payload satisfying both prompt specifications
@@ -67,6 +69,14 @@ impl ExecuteErrorResponse {
             kev_scores,
         }
     }
+
+    /// Sanitizes message and reason against known secrets, API keys, and sensitive tokens.
+    pub fn sanitize(&mut self, known_secrets: &[String]) {
+        self.message = crate::audit::redact_string(&self.message, known_secrets);
+        if let Some(r) = &mut self.reason {
+            *r = crate::audit::redact_string(r, known_secrets);
+        }
+    }
 }
 
 /// Specialized HTTP 401 Unauthorized response matching exact prompt requirement.
@@ -94,7 +104,7 @@ pub async fn execute_handler(
         Ok(parsed) => parsed,
         Err(e) => {
             let latency_ms = start_time.elapsed().as_millis() as u64;
-            let err_resp = ExecuteErrorResponse::new(
+            let mut err_resp = ExecuteErrorResponse::new(
                 "Malformed",
                 "malformed",
                 "Malformed request payload",
@@ -103,6 +113,7 @@ pub async fn execute_handler(
                 )),
                 None,
             );
+            err_resp.sanitize(state.audit_logger.known_secrets());
 
             let entry = AuditEntry {
                 timestamp: chrono::Utc::now(),
@@ -134,10 +145,12 @@ pub async fn execute_handler(
         untrusted_inputs = req.context.untrusted_inputs.len(),
         "B1 tool call received"
     );
+    let mut payload_for_preview = serde_json::Value::Object(req.payload.clone());
+    state.audit_logger.redact_value(&mut payload_for_preview);
     tracing::trace!(
         payload = %crate::debug::preview(
-            &serde_json::to_string(&req.payload).unwrap_or_default(),
-            crate::debug::PREVIEW_CHARS
+            &serde_json::to_string(&payload_for_preview).unwrap_or_default(),
+            crate::debug::preview_chars()
         ),
         "B1 payload preview"
     );
@@ -180,18 +193,38 @@ pub async fn execute_handler(
     // =========================================================================
     // Step 3: Parallel Evaluation via tokio::join!
     // =========================================================================
-    let policy_engine = Arc::clone(&state.policy_engine);
+    // Snapshot of the live policy (reloaded when the file changes), used for the whole request.
+    let policy_snapshot = state.current_policy();
+    let policy_engine = Arc::clone(&policy_snapshot);
     let decision_engine = Arc::clone(&state.decision_engine);
     let claims_clone = claims.clone();
     let req_policy = req.clone();
     let req_ml = req.clone();
 
-    let timeout_ms = policy_engine.defaults().model_timeout_ms;
+    let is_tool = req.resolved_tool_name(&policy_engine).is_some()
+        || policy_engine.get_tool(&req.endpoint).is_some();
+    let (effective_max_inj, effective_max_intent) = if is_tool {
+        let tool_name = req
+            .resolved_tool_name(&policy_engine)
+            .unwrap_or(&req.endpoint);
+        policy_engine.effective_thresholds_for_tool(tool_name)
+    } else {
+        policy_engine.effective_thresholds_for_endpoint(&req.endpoint)
+    };
+
+    let timeout_ms = if is_tool {
+        let tool_name = req
+            .resolved_tool_name(&policy_engine)
+            .unwrap_or(&req.endpoint);
+        policy_engine.effective_timeout_for_tool(tool_name)
+    } else {
+        policy_engine.effective_timeout_for_endpoint(&req.endpoint)
+    };
     let timeout_dur = Duration::from_millis(timeout_ms);
 
     let checks_start = Instant::now();
     let (policy_result, ml_result) = tokio::join!(
-        async move { evaluate_policy_detailed(&policy_engine, &claims_clone, &req_policy) },
+        async move { evaluate_target_detailed(&policy_engine, &claims_clone, &req_policy) },
         async move {
             tokio::time::timeout(timeout_dur, decision_engine.evaluate_tool_call(&req_ml)).await
         }
@@ -229,15 +262,30 @@ pub async fn execute_handler(
     // Priority 3 through 7: Deterministic Policy Failures
     // =========================================================================
     if let Err(policy_deny) = policy_result {
+        state.alert_hub.publish(crate::alerts::new_alert(
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown"),
+            Some(req.session_id.clone()),
+            "POST /api/execute",
+            &req.endpoint,
+            policy_deny.rule,
+            &policy_deny.message,
+            ml_verdict.as_ref().map(|v| v.injection_confidence),
+            ml_verdict.as_ref().map(|v| v.malicious_intent),
+            false,
+        ));
         tracing::debug!(rule = policy_deny.rule, "B5 deny: policy rule -> 403");
         let latency_ms = start_time.elapsed().as_millis() as u64;
-        let err_resp = ExecuteErrorResponse::new(
+        let mut err_resp = ExecuteErrorResponse::new(
             policy_deny.error,
             policy_deny.rule,
             policy_deny.message.clone(),
             Some(policy_deny.message.clone()),
             ml_scores,
         );
+        err_resp.sanitize(state.audit_logger.known_secrets());
 
         let entry = AuditEntry {
             timestamp: chrono::Utc::now(),
@@ -262,18 +310,34 @@ pub async fn execute_handler(
     // =========================================================================
     // Priority 8: ML Risk Score High / Model Unavailable
     // =========================================================================
-    let defaults = state.policy_engine.defaults();
+    let defaults = policy_snapshot.defaults();
+    let mut approved_by_human = false;
 
     if ml_timed_out_or_failed && defaults.fail_closed {
+        state.alert_hub.publish(crate::alerts::new_alert(
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown"),
+            Some(req.session_id.clone()),
+            "POST /api/execute",
+            &req.endpoint,
+            "model_unavailable",
+            "Model evaluation timed out or failed",
+            None,
+            None,
+            false,
+        ));
         tracing::debug!("B5 deny: model unavailable and fail_closed -> 403");
         let latency_ms = start_time.elapsed().as_millis() as u64;
-        let err_resp = ExecuteErrorResponse::new(
+        let mut err_resp = ExecuteErrorResponse::new(
             "ModelUnavailable",
             "model_unavailable",
             "Model evaluation timed out or failed",
             Some("Model evaluation timed out or failed".to_string()),
             None,
         );
+        err_resp.sanitize(state.audit_logger.known_secrets());
 
         let entry = AuditEntry {
             timestamp: chrono::Utc::now(),
@@ -296,49 +360,86 @@ pub async fn execute_handler(
     }
 
     if let Some(verdict) = &ml_verdict {
-        if !verdict.is_safe(
-            defaults.max_injection_confidence,
-            defaults.max_malicious_intent,
-        ) {
-            tracing::debug!(
-                injection = verdict.injection_confidence,
-                max_injection = defaults.max_injection_confidence,
-                intent = verdict.malicious_intent,
-                max_intent = defaults.max_malicious_intent,
-                "B5 deny: model score at or above threshold -> 403"
-            );
-            let latency_ms = start_time.elapsed().as_millis() as u64;
-            let err_resp = ExecuteErrorResponse::new(
-                "ModelRiskHigh",
-                "ml_risk",
-                "Model risk threshold exceeded",
-                Some("Model risk threshold exceeded".to_string()),
-                ml_scores,
-            );
-
-            let entry = AuditEntry {
-                timestamp: chrono::Utc::now(),
-                route: "POST /api/execute".to_string(),
-                session_id: Some(req.session_id.clone()),
-                caller_sub: Some(claims.sub.clone()),
-                caller_role: Some(claims.role.clone()),
-                target_endpoint: Some(req.endpoint.clone()),
-                method: Some(req.method.clone()),
-                decision: "deny".to_string(),
-                matched_rule: Some(DenyRule::ModelRiskHigh),
-                reason: Some("Model risk threshold exceeded".to_string()),
-                injection_confidence: Some(verdict.injection_confidence),
-                malicious_intent: Some(verdict.malicious_intent),
-                latency_ms,
+        if verdict.injection_confidence >= effective_max_inj
+            || verdict.malicious_intent >= effective_max_intent
+        {
+            // Just over the threshold: ask the human (scripts/alert_notifier.py) when one is
+            // listening. Every score that is over must be within the band.
+            let band = defaults.human_approval_band;
+            let within = |score: f32, max: f32| {
+                score < max || crate::alerts::near_threshold(score, max, band)
             };
-            let _ = state.audit_logger.log(entry);
+            let approval_timeout = defaults.human_approval_timeout_ms;
+            let ask = approval_timeout > 0
+                && within(verdict.injection_confidence, effective_max_inj)
+                && within(verdict.malicious_intent, effective_max_intent);
+            let alert = crate::alerts::new_alert(
+                headers
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown"),
+                Some(req.session_id.clone()),
+                "POST /api/execute",
+                &req.endpoint,
+                "model_risk_high",
+                "Kev score is at or above the configured threshold",
+                Some(verdict.injection_confidence),
+                Some(verdict.malicious_intent),
+                ask,
+            );
+            let approved_once = if ask {
+                state
+                    .alert_hub
+                    .request_approval(alert, Duration::from_millis(approval_timeout))
+                    .await
+            } else {
+                state.alert_hub.publish(alert);
+                false
+            };
+            if !approved_once {
+                tracing::debug!(
+                    injection = verdict.injection_confidence,
+                    max_injection = effective_max_inj,
+                    intent = verdict.malicious_intent,
+                    max_intent = effective_max_intent,
+                    "B5 deny: model score at or above threshold -> 403"
+                );
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                let mut err_resp = ExecuteErrorResponse::new(
+                    "ModelRiskHigh",
+                    "ml_risk",
+                    "Model risk threshold exceeded",
+                    Some("Model risk threshold exceeded".to_string()),
+                    ml_scores,
+                );
+                err_resp.sanitize(state.audit_logger.known_secrets());
 
-            return (StatusCode::FORBIDDEN, Json(err_resp)).into_response();
+                let entry = AuditEntry {
+                    timestamp: chrono::Utc::now(),
+                    route: "POST /api/execute".to_string(),
+                    session_id: Some(req.session_id.clone()),
+                    caller_sub: Some(claims.sub.clone()),
+                    caller_role: Some(claims.role.clone()),
+                    target_endpoint: Some(req.endpoint.clone()),
+                    method: Some(req.method.clone()),
+                    decision: "deny".to_string(),
+                    matched_rule: Some(DenyRule::ModelRiskHigh),
+                    reason: Some("Model risk threshold exceeded".to_string()),
+                    injection_confidence: Some(verdict.injection_confidence),
+                    malicious_intent: Some(verdict.malicious_intent),
+                    latency_ms,
+                };
+                let _ = state.audit_logger.log(entry);
+
+                return (StatusCode::FORBIDDEN, Json(err_resp)).into_response();
+            }
+            tracing::debug!("B5 human allowed this borderline call once");
+            approved_by_human = true;
         }
     }
 
     // =========================================================================
-    // Step 5: Request Signing & Outbound Backend Forwarding
+    // Step 5: Request Signing & Outbound Execution
     // =========================================================================
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -354,8 +455,50 @@ pub async fn execute_handler(
         &outbound_payload_bytes,
     );
 
-    let target_path = state
-        .policy_engine
+    // If target is an approved local CLI tool (no backend_url configured):
+    if is_tool && policy_snapshot.backend_url_for(&req.endpoint).is_none() {
+        let latency_ms = start_time.elapsed().as_millis() as u64;
+        let entry = AuditEntry {
+            timestamp: chrono::Utc::now(),
+            route: "POST /api/execute".to_string(),
+            session_id: Some(req.session_id.clone()),
+            caller_sub: Some(claims.sub.clone()),
+            caller_role: Some(claims.role.clone()),
+            target_endpoint: Some(req.endpoint.clone()),
+            method: Some(req.method.clone()),
+            decision: "allow".to_string(),
+            matched_rule: None,
+            reason: approved_by_human.then(|| crate::alerts::HUMAN_ALLOWED_ONCE.to_string()),
+            injection_confidence: ml_verdict.as_ref().map(|v| v.injection_confidence),
+            malicious_intent: ml_verdict.as_ref().map(|v| v.malicious_intent),
+            latency_ms,
+        };
+        let _ = state.audit_logger.log(entry);
+
+        let allow_resp = RouteBAllowResponse {
+            decision: "allow".to_string(),
+            endpoint: req.endpoint.clone(),
+            kev_scores: ml_scores.unwrap_or(KevScores {
+                injection_confidence: 0.01,
+                malicious_intent: 0.01,
+            }),
+            backend_response: serde_json::json!({
+                "status": "approved",
+                "tool": req.endpoint,
+                "timestamp": timestamp,
+                "signature": signature,
+            }),
+        };
+
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        response_headers.insert(HEADER_TIMESTAMP, timestamp.to_string().parse().unwrap());
+        response_headers.insert(HEADER_SIGNATURE, signature.parse().unwrap());
+
+        return (StatusCode::OK, response_headers, Json(allow_resp)).into_response();
+    }
+
+    let target_path = policy_snapshot
         .backend_url_for(&req.endpoint)
         .and_then(|u| {
             if let Some(pos) = u.find("://") {
@@ -377,7 +520,7 @@ pub async fn execute_handler(
                 format!("/{target_path}")
             }
         )
-    } else if let Some(url) = state.policy_engine.backend_url_for(&req.endpoint) {
+    } else if let Some(url) = policy_snapshot.backend_url_for(&req.endpoint) {
         url.to_string()
     } else {
         format!(
@@ -420,13 +563,14 @@ pub async fn execute_handler(
         Err(e) => {
             tracing::debug!(error = %e, "B6 backend unreachable -> 502");
             let latency_ms = start_time.elapsed().as_millis() as u64;
-            let err_resp = ExecuteErrorResponse::new(
+            let mut err_resp = ExecuteErrorResponse::new(
                 "BackendError",
                 "backend_error",
                 format!("Downstream backend connection failed: {e}"),
                 Some(format!("Downstream backend connection failed: {e}")),
                 ml_scores,
             );
+            err_resp.sanitize(state.audit_logger.known_secrets());
 
             let entry = AuditEntry {
                 timestamp: chrono::Utc::now(),
@@ -463,6 +607,17 @@ pub async fn execute_handler(
     }
 
     let resp_bytes = backend_resp.bytes().await.unwrap_or_default();
+    let resp_bytes = if !backend_status.is_success() {
+        if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+            state.audit_logger.redact_value(&mut val);
+            Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| resp_bytes.to_vec()))
+        } else {
+            let text = String::from_utf8_lossy(&resp_bytes);
+            Bytes::from(state.audit_logger.redact_string(&text).into_bytes())
+        }
+    } else {
+        resp_bytes
+    };
     let latency_ms = start_time.elapsed().as_millis() as u64;
 
     // Log successful execution
@@ -476,7 +631,7 @@ pub async fn execute_handler(
         method: Some(req.method.clone()),
         decision: "allow".to_string(),
         matched_rule: None,
-        reason: None,
+        reason: approved_by_human.then(|| crate::alerts::HUMAN_ALLOWED_ONCE.to_string()),
         injection_confidence: ml_verdict.as_ref().map(|v| v.injection_confidence),
         malicious_intent: ml_verdict.as_ref().map(|v| v.malicious_intent),
         latency_ms,
@@ -488,6 +643,17 @@ pub async fn execute_handler(
 
 /// Emits HTTP 401 Unauthorized response and records audit log.
 fn emit_unauthorized(state: &AppState, req: &ToolExecuteRequest, start_time: Instant) -> Response {
+    state.alert_hub.publish(crate::alerts::new_alert(
+        "unknown",
+        Some(req.session_id.clone()),
+        "POST /api/execute",
+        &req.endpoint,
+        "unauthorized_token",
+        "Missing or invalid bearer token",
+        None,
+        None,
+        false,
+    ));
     let latency_ms = start_time.elapsed().as_millis() as u64;
     let resp = UnauthorizedResponse {
         error: "unauthorized".to_string(),
@@ -524,6 +690,77 @@ struct PolicyDenyInfo {
     rule: &'static str,
     message: String,
     deny_rule: DenyRule,
+}
+
+/// Evaluates policy rules for either a local CLI tool or a microservice endpoint.
+fn evaluate_target_detailed(
+    engine: &PolicyEngine,
+    claims: &AgentClaims,
+    req: &ToolExecuteRequest,
+) -> Result<(), PolicyDenyInfo> {
+    if let Some(tool_name) = req.resolved_tool_name(engine) {
+        evaluate_tool_detailed(engine, claims, tool_name, &req.payload)
+    } else if engine.get_tool(&req.endpoint).is_some() {
+        evaluate_tool_detailed(engine, claims, &req.endpoint, &req.payload)
+    } else {
+        evaluate_policy_detailed(engine, claims, req)
+    }
+}
+
+/// Evaluates tool-specific deterministic policy rules (enabled, roles, required_args, constraints).
+fn evaluate_tool_detailed(
+    engine: &PolicyEngine,
+    claims: &AgentClaims,
+    tool_name: &str,
+    payload: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), PolicyDenyInfo> {
+    // Priority 3: Tool allowlist & enabled check
+    let tool_rule = match engine.get_tool(tool_name) {
+        Some(rule) if rule.enabled => rule,
+        _ => {
+            return Err(PolicyDenyInfo {
+                status: StatusCode::FORBIDDEN,
+                error: "EndpointDenied",
+                rule: "endpoint",
+                message: format!("Tool '{tool_name}' is not allowlisted or disabled"),
+                deny_rule: DenyRule::EndpointDenied,
+            });
+        }
+    };
+
+    // Priority 5: Caller role authorization against allowed_roles
+    let role_authorized = tool_rule.allowed_roles.iter().any(|r| r == &claims.role);
+    if !role_authorized {
+        return Err(PolicyDenyInfo {
+            status: StatusCode::FORBIDDEN,
+            error: "UnauthorizedRole",
+            rule: "role",
+            message: format!(
+                "Role '{}' is unauthorized for tool '{tool_name}'",
+                claims.role
+            ),
+            deny_rule: DenyRule::UnauthorizedRole,
+        });
+    }
+
+    // Priority 6: Required arguments validation
+    for req_arg in &tool_rule.required_args {
+        match payload.get(req_arg) {
+            Some(val) if !val.is_null() => {}
+            _ => {
+                return Err(PolicyDenyInfo {
+                    status: StatusCode::FORBIDDEN,
+                    error: "MissingArg",
+                    rule: "required_args",
+                    message: format!("Missing required argument: {req_arg}"),
+                    deny_rule: DenyRule::MissingArg,
+                });
+            }
+        }
+    }
+
+    // Priority 7: Argument constraints validation
+    validate_constraints_detailed(payload, &tool_rule.constraints)
 }
 
 /// Evaluates deterministic zero-trust policy rules in strict priority order (Steps 3-7).
@@ -598,13 +835,21 @@ fn evaluate_policy_detailed(
         }
     }
 
-    // Priority 7: Argument constraints validation (max_len & regex)
-    let mut sorted_keys: Vec<_> = endpoint_rule.constraints.keys().collect();
+    // Priority 7: Argument constraints validation
+    validate_constraints_detailed(&req.payload, &endpoint_rule.constraints)
+}
+
+/// Priority 7: Argument constraints validation (max_len & regex)
+fn validate_constraints_detailed(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    constraints: &std::collections::HashMap<String, crate::policy::CompiledArgConstraint>,
+) -> Result<(), PolicyDenyInfo> {
+    let mut sorted_keys: Vec<_> = constraints.keys().collect();
     sorted_keys.sort();
 
     for arg_name in sorted_keys {
-        let constraint = &endpoint_rule.constraints[arg_name];
-        if let Some(val) = req.payload.get(arg_name) {
+        let constraint = &constraints[arg_name];
+        if let Some(val) = payload.get(arg_name) {
             if val.is_null() {
                 return Err(PolicyDenyInfo {
                     status: StatusCode::FORBIDDEN,

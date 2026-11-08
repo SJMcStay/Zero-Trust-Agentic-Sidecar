@@ -253,7 +253,7 @@ async fn spawn_live_sidecar_with_policy(
 #[tokio::test]
 async fn test_e2e_route_a_safe_streaming_and_prompt_injection_blocking() {
     let (upstream_url, upstream_hits) = spawn_mock_anthropic_upstream(E2E_ANTHROPIC_KEY).await;
-    let engine = Arc::new(SyntheticKevEngine::new().expect("init SyntheticKevEngine"));
+    let engine = Arc::new(SyntheticKevEngine::for_cpu().expect("init SyntheticKevEngine"));
     let (sidecar_url, _cfg, audit_logs) =
         spawn_live_sidecar(upstream_url, "http://127.0.0.1:59999".to_string(), engine).await;
 
@@ -399,7 +399,7 @@ async fn test_e2e_route_b_and_live_flask_choke_point_full_matrix() {
 
     // 2. Spawn the Rust Axum sidecar connected to the live Flask backend
     let (upstream_url, _) = spawn_mock_anthropic_upstream(E2E_ANTHROPIC_KEY).await;
-    let engine = Arc::new(SyntheticKevEngine::new().expect("init SyntheticKevEngine"));
+    let engine = Arc::new(SyntheticKevEngine::for_cpu().expect("init SyntheticKevEngine"));
     let (sidecar_url, config, audit_logs) =
         spawn_live_sidecar(upstream_url, flask.base_url.clone(), engine).await;
 

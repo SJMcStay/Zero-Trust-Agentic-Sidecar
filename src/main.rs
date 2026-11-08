@@ -9,6 +9,14 @@ use zero_trust_agentic_sidecar::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `zero-trust-agentic-sidecar env <cli>`: print the environment that sends an agent CLI's
+    // traffic through the sidecar ([agent_cli_mappings]; used by scripts/agent.sh). Needs only
+    // POLICY_PATH, no secrets.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("env") {
+        std::process::exit(print_agent_env(args.get(2).map(String::as_str)));
+    }
+
     // 1. Initialize tracing subscriber
     // ZT_DEBUG=1 / 2 turns on per-step debug output (see src/debug.rs); RUST_LOG overrides.
     tracing_subscriber::fmt()
@@ -40,11 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "startup config (secrets never printed)"
     );
 
-    // 3. Initialize structured JSONL audit logger with secret redaction
-    let audit_logger = Arc::new(AuditLogger::from_config(&config));
-    tracing::info!("Structured audit logger initialized");
-
-    // 4. Load deterministic policy configuration from TOML
+    // 3. Load deterministic policy configuration from TOML
     let policy_engine = match PolicyEngine::from_file(&config.policy_path) {
         Ok(engine) => Arc::new(engine),
         Err(err) => {
@@ -59,6 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Deterministic policy engine loaded from {:?}",
         config.policy_path
     );
+
+    // 4. Initialize structured JSONL audit logger with secret redaction (including CLI mapping keys)
+    let mut audit_logger_inst = AuditLogger::from_config(&config);
+    audit_logger_inst.register_cli_mapping_secrets_from_env(&policy_engine);
+    let audit_logger = Arc::new(audit_logger_inst);
+    tracing::info!("Structured audit logger initialized");
     let d = policy_engine.defaults();
     tracing::debug!(
         max_injection = d.max_injection_confidence,
@@ -88,13 +98,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // 7. Assemble shared AppState & Axum Router
+    // Edits to the policy file apply without a restart (checked at most once a second;
+    // a broken edit keeps the last good policy).
+    let live_policy = Arc::new(zero_trust_agentic_sidecar::LivePolicy::new(
+        config.policy_path.clone(),
+        Arc::clone(&policy_engine),
+    ));
     let state = AppState::new(
         config.clone(),
         policy_engine,
         decision_engine,
         audit_logger,
         http_client,
-    );
+    )
+    .with_live_policy(live_policy);
     let app = create_router(state);
 
     // 8. Bind TCP listener
@@ -105,9 +122,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 9. Start server with graceful shutdown handling
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("Zero-Trust Agentic Sidecar shut down cleanly");
     Ok(())
@@ -174,5 +194,29 @@ async fn shutdown_signal() {
         _ = terminate => {
             tracing::info!("Received SIGTERM, draining active connections...");
         },
+    }
+}
+
+/// `env <cli>`: one `NAME=value` line per variable, base URL first. Exit 2 on any problem.
+fn print_agent_env(cli: Option<&str>) -> i32 {
+    let Some(cli) = cli else {
+        eprintln!("usage: zero-trust-agentic-sidecar env <cli>");
+        return 2;
+    };
+    let path = std::env::var("POLICY_PATH").unwrap_or_else(|_| "policy.toml".to_string());
+    let result = PolicyEngine::from_file(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|policy| policy.agent_env(cli));
+    match result {
+        Ok(vars) => {
+            for (key, value) in vars {
+                println!("{key}={value}");
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("{path}: {err}");
+            2
+        }
     }
 }

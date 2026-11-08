@@ -1,10 +1,40 @@
+# Zero-trust policy. Checked strictly at load: an unknown key, a threshold outside 0..1 or a
+# timeout outside 1..60000 ms stops the sidecar. Edits apply within a second without a restart;
+# an invalid edit is logged and the last good policy stays. Your copy: policy.local.toml
+# (scripts/init.sh), selected by POLICY_PATH.
+
 [defaults]
-max_injection_confidence = 0.70
-max_malicious_intent = 0.50
-model_timeout_ms = 500
+max_injection_confidence = 0.70   # block at or above this Kev P(prompt injection)
+max_malicious_intent = 0.50       # Route B: block at or above this Kev P(harmful tool call)
+model_timeout_ms = 500            # Kev must answer within this, else deny (tests rely on 500)
+# Borderline model blocks (score at or above the threshold by at most the band) wait for the
+# human's "Allow once" / "Block" in scripts/alert_notifier.py; no notifier or no answer = block.
+human_approval_timeout_ms = 15000 # 0 disables; at most 60000
+human_approval_band = 0.10        # 1.0 asks about every model block (demo)
 fail_closed = true
 require_jwt = true
 
+# Route A: POST /v1/messages (Claude Code and other Anthropic-API agents). Values are the defaults.
+[route_a]
+mode = "enforce"                  # "monitor": never block, only log and alert (to calibrate)
+score = "new"                     # "all": system prompt and every message, every turn
+include_user_text = true          # with "new": also score what the human typed
+include_system_prompt = false     # with "new": also score the system prompt, every turn (slow)
+on_block = "error"                # "message": a reply the agent shows, instead of HTTP 403
+remember_blocked = true           # keep blocking a conversation that still carries blocked content
+context_chars = 1000              # characters of the user's latest request sent to Kev as context
+# Harness text removed from user text before scoring. Never applied to tool results.
+skip_patterns = ['(?s)<system-reminder>.*?</system-reminder>']
+# User text that is really tool output (Claude Code inlines @file mentions): scored whole.
+inline_tool_output_patterns = ['Result of calling the (?P<tool>\w+) tool']
+# Exact harness text appended to tool results. Keep exact: a loose pattern hides injections.
+tool_output_skip_patterns = []
+
+[alerts]
+desktop = false                   # native notification when something is blocked or flagged
+
+# Route B: POST /api/execute to a backend endpoint. Thresholds and model_timeout_ms can be
+# overridden per endpoint.
 [endpoints."/api/v1/system/status"]
 backend_url = "http://127.0.0.1:5000/api/v1/system/status"
 enabled = true
@@ -21,6 +51,8 @@ allowed_roles = ["agent", "admin"]
 required_args = ["to", "body"]
 constraints.to = { regex = "^[^@]+@ourcompany\\.com$", max_len = 128 }
 constraints.body = { max_len = 2000 }
+max_injection_confidence = 0.65   # stricter than [defaults] for outbound email
+max_malicious_intent = 0.35
 
 [endpoints."/api/v1/db/drop"]
 backend_url = "http://127.0.0.1:5000/api/v1/db/drop"
@@ -28,3 +60,51 @@ enabled = false
 allowed_methods = ["POST"]
 allowed_roles = []
 required_args = ["table"]
+
+# Route B: POST /api/execute with "tool": "<name>" for a tool the agent runs locally. Approved
+# calls get a signed allow; nothing is forwarded.
+[tools."bash"]
+enabled = true
+allowed_roles = ["admin"]
+required_args = ["command"]
+constraints.command = { regex = "^[a-zA-Z0-9_./ -]+$", max_len = 512 }   # no quotes, pipes, $ or ;
+max_malicious_intent = 0.40
+
+[tools."file_edit"]
+enabled = true
+allowed_roles = ["agent", "admin"]
+required_args = ["path", "content"]
+constraints.path = { regex = "^[a-zA-Z0-9_./-]+$", max_len = 256 }
+constraints.content = { max_len = 32768 }
+max_malicious_intent = 0.40
+
+[tools."web_fetch"]
+enabled = true
+allowed_roles = ["agent", "admin"]
+required_args = ["url"]
+constraints.url = { regex = "^https://[a-zA-Z0-9.-]+(/.*)?$", max_len = 1024 }
+max_injection_confidence = 0.60
+
+# Environment that sends an agent CLI's traffic through the sidecar: scripts/agent.sh <name>.
+# api_key_env_var values are redacted from logs. Only protocol = "anthropic" is served today;
+# codex and ollama need adapters (tickets AD1-AD3) and agent.sh refuses them until then.
+[agent_cli_mappings.claude]
+env_var = "ANTHROPIC_BASE_URL"
+api_key_env_var = "ANTHROPIC_API_KEY"
+sidecar_url = "http://127.0.0.1:8080"
+upstream_url = "https://api.anthropic.com/v1/messages"
+protocol = "anthropic"
+extra_env = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+
+[agent_cli_mappings.codex]
+env_var = "OPENAI_BASE_URL"
+api_key_env_var = "OPENAI_API_KEY"
+sidecar_url = "http://127.0.0.1:8080/v1"
+upstream_url = "https://api.openai.com/v1/chat/completions"
+protocol = "openai"
+
+[agent_cli_mappings.ollama]
+env_var = "OLLAMA_HOST"
+sidecar_url = "http://127.0.0.1:8080"
+upstream_url = "http://127.0.0.1:11434"
+protocol = "ollama"

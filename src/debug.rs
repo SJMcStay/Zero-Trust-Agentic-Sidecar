@@ -5,15 +5,26 @@
 //!   decision and why, where it was forwarded, and how long each step took.
 //! - `ZT_DEBUG=2`: also previews of prompt / tool text and payload values. These can contain
 //!   secrets: local debugging only.
+//! - `ZT_DEBUG=3`: previews untruncated (the exact text Kev scores), for tuning skip patterns.
 //! - `RUST_LOG=...` overrides both (standard `tracing` filter syntax).
 //!
 //! The same `ZT_DEBUG` switches on step output in `scripts/*.sh` (`set -x`),
 //! `scripts/fetch_model.py` and `backend/app.py`.
 
+use std::sync::OnceLock;
 use tracing_subscriber::EnvFilter;
 
 /// Characters of text shown by `ZT_DEBUG=2` previews.
 pub const PREVIEW_CHARS: usize = 200;
+
+/// Preview length: [`PREVIEW_CHARS`], or no limit with `ZT_DEBUG=3`.
+pub fn preview_chars() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| match std::env::var("ZT_DEBUG").as_deref() {
+        Ok("3") | Ok("full") => usize::MAX,
+        _ => PREVIEW_CHARS,
+    })
+}
 
 /// Log filter: `RUST_LOG` if set, else the level `ZT_DEBUG` asks for, else info.
 pub fn log_filter() -> EnvFilter {
@@ -21,7 +32,7 @@ pub fn log_filter() -> EnvFilter {
         return filter;
     }
     let level = match std::env::var("ZT_DEBUG").as_deref() {
-        Ok("2") | Ok("trace") => "trace",
+        Ok("2") | Ok("3") | Ok("trace") | Ok("full") => "trace",
         Ok("1") | Ok("true") | Ok("debug") => "debug",
         _ => "info",
     };

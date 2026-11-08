@@ -46,6 +46,9 @@ impl std::str::FromStr for KevEngineKind {
     }
 }
 
+/// Minimum permitted byte length for cryptographic secrets (`SIDECAR_SECRET`, `JWT_SECRET`).
+pub const MIN_SECRET_LENGTH: usize = 16;
+
 /// Runtime configuration settings for the Zero-Trust Agentic Sidecar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -111,15 +114,17 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let upstream_llm_url = env_map
+        let upstream_llm_url_raw = env_map
             .get("UPSTREAM_LLM_URL")
-            .cloned()
-            .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
+            .map(|s| s.as_str())
+            .unwrap_or("https://api.anthropic.com/v1/messages");
+        let upstream_llm_url = Self::validate_url("UPSTREAM_LLM_URL", upstream_llm_url_raw)?;
 
-        let flask_backend_url = env_map
+        let flask_backend_url_raw = env_map
             .get("FLASK_BACKEND_URL")
-            .cloned()
-            .unwrap_or_else(|| "http://127.0.0.1:5000".to_string());
+            .map(|s| s.as_str())
+            .unwrap_or("http://127.0.0.1:5000");
+        let flask_backend_url = Self::validate_url("FLASK_BACKEND_URL", flask_backend_url_raw)?;
 
         let policy_path = env_map
             .get("POLICY_PATH")
@@ -138,10 +143,11 @@ impl Config {
             None => KevEngineKind::Http,
         };
 
-        let kev_url = env_map
+        let kev_url_raw = env_map
             .get("KEV_URL")
-            .cloned()
-            .unwrap_or_else(|| "http://127.0.0.1:8008".to_string());
+            .map(|s| s.as_str())
+            .unwrap_or("http://127.0.0.1:8008");
+        let kev_url = Self::validate_url("KEV_URL", kev_url_raw)?;
 
         let kev_model = env_map
             .get("KEV_MODEL")
@@ -179,15 +185,67 @@ impl Config {
         }
     }
 
+    /// Validates that a secret is present, non-empty, and satisfies minimum length requirements.
+    /// Never leaks the secret value in error messages or traces.
     fn get_required_secret(
         env_map: &HashMap<String, String>,
         var_name: &'static str,
     ) -> Result<String, ConfigError> {
         match env_map.get(var_name) {
-            Some(val) if val.trim().is_empty() => Err(ConfigError::EmptyVar(var_name)),
-            Some(val) => Ok(val.clone()),
             None => Err(ConfigError::MissingVar(var_name)),
+            Some(val) if val.trim().is_empty() => Err(ConfigError::EmptyVar(var_name)),
+            Some(val) if val.len() < MIN_SECRET_LENGTH => Err(ConfigError::InvalidValue {
+                var: var_name,
+                reason: format!(
+                    "secret length must be at least {MIN_SECRET_LENGTH} bytes (got {} bytes)",
+                    val.len()
+                ),
+            }),
+            Some(val) => Ok(val.clone()),
         }
+    }
+
+    /// Validates that a URL is non-empty, uses http/https scheme, and specifies a valid host.
+    pub fn validate_url(var_name: &'static str, raw_url: &str) -> Result<String, ConfigError> {
+        let trimmed = raw_url.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                var: var_name,
+                reason: "URL cannot be empty or whitespace".to_string(),
+            });
+        }
+
+        let parsed = reqwest::Url::parse(trimmed).map_err(|e| ConfigError::InvalidValue {
+            var: var_name,
+            reason: format!("Failed to parse URL '{trimmed}': {e}"),
+        })?;
+
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    var: var_name,
+                    reason: format!("URL scheme must be 'http' or 'https', got '{other}'"),
+                });
+            }
+        }
+
+        if parsed.host_str().is_none_or(|h| h.is_empty()) {
+            return Err(ConfigError::InvalidValue {
+                var: var_name,
+                reason: format!("URL '{trimmed}' must include a valid host"),
+            });
+        }
+
+        Ok(trimmed.to_string())
+    }
+
+    /// Convenience helper to retrieve CLI environment mapping from an active PolicyEngine.
+    pub fn get_cli_env(
+        policy: &crate::policy::PolicyEngine,
+        cli_name: &str,
+    ) -> Option<HashMap<String, String>> {
+        policy.get_cli_env(cli_name)
     }
 }
 
@@ -247,11 +305,13 @@ mod tests {
     #[test]
     fn test_config_from_vars_default_fallbacks() {
         let vars = [
-            ("SIDECAR_SECRET", "test-sidecar-secret"),
-            ("JWT_SECRET", "test-jwt-secret"),
+            ("SIDECAR_SECRET", "test-sidecar-secret-16b"),
+            ("JWT_SECRET", "test-jwt-secret-16b"),
         ];
 
         let config = Config::from_vars(vars).expect("Config should parse successfully");
+        assert_eq!(config.sidecar_secret, "test-sidecar-secret-16b");
+        assert_eq!(config.jwt_secret, "test-jwt-secret-16b");
         assert_eq!(config.sidecar_addr, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(config.anthropic_api_key, None);
         assert_eq!(
@@ -268,8 +328,8 @@ mod tests {
     #[test]
     fn test_config_invalid_kev_engine_fails() {
         let vars = [
-            ("SIDECAR_SECRET", "secret-1"),
-            ("JWT_SECRET", "secret-2"),
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
             ("KEV_ENGINE", "onnx"),
         ];
         match Config::from_vars(vars).unwrap_err() {
@@ -280,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_config_missing_sidecar_secret_fails_closed() {
-        let vars = [("JWT_SECRET", "jwt-secret-only")];
+        let vars = [("JWT_SECRET", "valid-jwt-secret-16b")];
         let err = Config::from_vars(vars).unwrap_err();
         assert_eq!(err, ConfigError::MissingVar("SIDECAR_SECRET"));
     }
@@ -289,7 +349,7 @@ mod tests {
     fn test_config_empty_sidecar_secret_fails_closed() {
         let vars = [
             ("SIDECAR_SECRET", "   \t\n"),
-            ("JWT_SECRET", "jwt-secret-val"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
         ];
         let err = Config::from_vars(vars).unwrap_err();
         assert_eq!(err, ConfigError::EmptyVar("SIDECAR_SECRET"));
@@ -297,14 +357,17 @@ mod tests {
 
     #[test]
     fn test_config_missing_jwt_secret_fails_closed() {
-        let vars = [("SIDECAR_SECRET", "sidecar-secret-only")];
+        let vars = [("SIDECAR_SECRET", "valid-sidecar-secret-16b")];
         let err = Config::from_vars(vars).unwrap_err();
         assert_eq!(err, ConfigError::MissingVar("JWT_SECRET"));
     }
 
     #[test]
     fn test_config_empty_jwt_secret_fails_closed() {
-        let vars = [("SIDECAR_SECRET", "sidecar-secret-val"), ("JWT_SECRET", "")];
+        let vars = [
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", ""),
+        ];
         let err = Config::from_vars(vars).unwrap_err();
         assert_eq!(err, ConfigError::EmptyVar("JWT_SECRET"));
     }
@@ -312,8 +375,8 @@ mod tests {
     #[test]
     fn test_config_invalid_sidecar_addr_fails() {
         let vars = [
-            ("SIDECAR_SECRET", "secret-1"),
-            ("JWT_SECRET", "secret-2"),
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
             ("SIDECAR_ADDR", "invalid-socket-address"),
         ];
         let err = Config::from_vars(vars).unwrap_err();
@@ -329,11 +392,115 @@ mod tests {
     #[test]
     fn test_config_whitespace_anthropic_api_key_sanitized_to_none() {
         let vars = [
-            ("SIDECAR_SECRET", "secret-1"),
-            ("JWT_SECRET", "secret-2"),
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
             ("ANTHROPIC_API_KEY", "   "),
         ];
         let config = Config::from_vars(vars).unwrap();
         assert_eq!(config.anthropic_api_key, None);
+    }
+
+    #[test]
+    fn test_config_secret_too_short_fails_without_leaking_value() {
+        let vars = [
+            ("SIDECAR_SECRET", "short-sec"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
+        ];
+        let err = Config::from_vars(vars).unwrap_err();
+        match &err {
+            ConfigError::InvalidValue { var, reason } => {
+                assert_eq!(*var, "SIDECAR_SECRET");
+                assert!(reason.contains("at least 16 bytes"));
+                assert!(reason.contains("9 bytes"));
+                // Invariant: Never leak secret value
+                assert!(!reason.contains("short-sec"));
+            }
+            other => panic!("Expected InvalidValue, got {:?}", other),
+        }
+
+        let vars2 = [
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", "short-jwt"),
+        ];
+        let err2 = Config::from_vars(vars2).unwrap_err();
+        match &err2 {
+            ConfigError::InvalidValue { var, reason } => {
+                assert_eq!(*var, "JWT_SECRET");
+                assert!(reason.contains("at least 16 bytes"));
+                assert!(!reason.contains("short-jwt"));
+            }
+            other => panic!("Expected InvalidValue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_config_url_validation_schemes_and_hosts() {
+        // Valid http and https URLs
+        assert!(Config::validate_url("TEST_URL", "http://127.0.0.1:8080").is_ok());
+        assert!(Config::validate_url("TEST_URL", "https://api.anthropic.com/v1").is_ok());
+
+        // Empty URL rejected
+        assert!(matches!(
+            Config::validate_url("TEST_URL", "  "),
+            Err(ConfigError::InvalidValue {
+                var: "TEST_URL",
+                ..
+            })
+        ));
+
+        // Invalid scheme rejected
+        assert!(matches!(
+            Config::validate_url("TEST_URL", "ftp://127.0.0.1:21"),
+            Err(ConfigError::InvalidValue {
+                var: "TEST_URL",
+                ..
+            })
+        ));
+
+        // Missing host rejected
+        assert!(matches!(
+            Config::validate_url("TEST_URL", "http://:8080"),
+            Err(ConfigError::InvalidValue {
+                var: "TEST_URL",
+                ..
+            })
+        ));
+
+        // Invalid URL format rejected in from_vars
+        let vars_bad_backend = [
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
+            ("FLASK_BACKEND_URL", "not a valid url"),
+        ];
+        assert!(matches!(
+            Config::from_vars(vars_bad_backend),
+            Err(ConfigError::InvalidValue {
+                var: "FLASK_BACKEND_URL",
+                ..
+            })
+        ));
+
+        let vars_bad_upstream = [
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
+            ("UPSTREAM_LLM_URL", "ftp://evil.com"),
+        ];
+        assert!(matches!(
+            Config::from_vars(vars_bad_upstream),
+            Err(ConfigError::InvalidValue {
+                var: "UPSTREAM_LLM_URL",
+                ..
+            })
+        ));
+
+        let vars_bad_kev = [
+            ("SIDECAR_SECRET", "valid-sidecar-secret-16b"),
+            ("JWT_SECRET", "valid-jwt-secret-16b"),
+            ("KEV_URL", "   "),
+        ];
+        assert!(matches!(
+            Config::from_vars(vars_bad_kev),
+            Err(ConfigError::InvalidValue { var: "KEV_URL", .. })
+        ));
     }
 }

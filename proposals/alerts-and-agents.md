@@ -1,6 +1,6 @@
 # Proposal: alert the human, keep the agent talking, work with any agent
 
-Status: proposal, tickets G1, AL1–AL3, AD1–AD3 in [design-doc.md](../design-doc.md).
+Status: G1, AL1 and AL2–AL3 implemented (`on_block = "message"`, `[alerts] desktop`, `GET /v1/alerts` with `scripts/alert_notifier.py` and one-time approval for borderline scores on Route A and B); AD1–AD3 open in [design-doc.md](../design-doc.md).
 
 ## Today
 

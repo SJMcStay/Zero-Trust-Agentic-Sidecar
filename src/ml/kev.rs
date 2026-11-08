@@ -1625,6 +1625,8 @@ impl SyntheticKevEngine {
             "dump secrets",
             "leak api key",
             "drop table", // Trigger injection confidence >= 0.85 as specified
+            "delete from",
+            "truncate",
         ];
 
         let has_injection = injection_phrases.iter().any(|&p| lower.contains(p));
