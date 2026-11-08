@@ -67,7 +67,7 @@ cargo build --release
 cat <<EOF
 
 Done. Run (see USAGE.md):
-  scripts/kev_server.sh                                   # terminal 1: Kev on 127.0.0.1:8008
-  source .venv/bin/activate && python backend/app.py      # terminal 2: backend on :5000
-  set -a && . ./.env && set +a && cargo run --release     # terminal 3: sidecar on :8080
+  scripts/kev_server.sh                                              # 1: Kev on 127.0.0.1:8008
+  set -a && . ./.env && set +a && .venv/bin/python backend/app.py   # 2: backend on :5000
+  set -a && . ./.env && set +a && cargo run --release               # 3: sidecar on :8080
 EOF
