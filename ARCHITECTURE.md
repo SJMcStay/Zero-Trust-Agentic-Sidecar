@@ -7,13 +7,12 @@ Why the sidecar is built the way it is. For contracts and tickets see `design-do
 Invariants. Breaking one breaks the security model.
 
 1. **Single choke point.** Backend accepts only sidecar-signed requests. Agent has no other path in.
-2. **Default deny.** Tool not in `policy.toml` = denied. No implicit allows.
-3. **Policy decides, model advises.** Model returns scores; fixed rules + thresholds turn them into allow/deny. Same inputs → same decision.
-4. **Fail closed.** Model timeout, model error, bad policy file → deny or refuse to start. Never allow on uncertainty.
-5. **Model is swappable.** Sidecar depends only on `DecisionModel` trait, never a concrete model.
-6. **Contracts live in one place.** `crates/common` holds types, trait, signing. Other crates never redefine them.
-7. **Never block the async runtime.** CPU-heavy inference runs in `spawn_blocking`.
-8. **Never log argument values.** Args may carry secrets or customer data. Log tool, decision, rule, scores, latency only.
+2. **Thresholds decide, model advises.** Model returns scores; fixed thresholds turn them into allow/deny. Same scores → same decision.
+3. **Fail closed.** Model timeout, model error, bad config → deny or refuse to start. Never allow on uncertainty.
+4. **Model is swappable.** Sidecar depends only on `DecisionModel` trait, never a concrete model.
+5. **Contracts live in one place.** `crates/common` holds types, trait, signing. Other crates never redefine them.
+6. **Never block the async runtime.** CPU-heavy inference runs in `spawn_blocking`.
+7. **Never log argument values.** Args may carry secrets or customer data. Log tool, decision, rule, scores, latency only.
 
 ## Critical decisions
 
@@ -26,31 +25,26 @@ Invariants. Breaking one breaks the security model.
 - **Cost:** agents need a small adapter to call us.
 - **Revisit:** MCP adapter is the first post-MVP feature.
 
-### Deterministic policy over model verdict
-- **Why:** security boundary must be explainable and reproducible. A probability can't be audited; "`to` must match `@ourcompany.com`" can.
-- **How:** policy rules run first in decision order, so exact reasons win over model scores when both fail.
-
-### Own TOML policy engine (not Cedar / OPA)
-- **Why:** MVP rules are allowlist, required args, regex, max_len. ~150 lines anyone can read fully.
-- **Detail:** `regex` crate is linear-time, so hostile args can't trigger catastrophic backtracking.
-- **Revisit:** need roles/principals → Cedar (Rust-native).
+### No policy check for now (model only)
+- **Why:** smallest path to a working sidecar; model + thresholds is the core idea.
+- **Cost:** no default deny. Any tool passes if scores are low; decisions are only as good as the model.
+- **Revisit:** add a tool allowlist + arg rules (own TOML engine first, Cedar if roles needed) as a check before the model.
 
 ### HMAC-SHA256 signing (not mTLS / JWT)
 - **Proves:** request came from sidecar, body unchanged, made in last 30 s.
-- **Does not prove:** request is safe. Only as good as the policy that approved it.
+- **Does not prove:** request is safe. Only as good as the model check that approved it.
 - **Detail:** constant-time compare, otherwise timing leaks matching bytes.
 - **Gap:** replay possible inside 30 s window → nonce cache later.
 - **Revisit:** sidecar and backend on different machines → mTLS.
 
-### Decision model in-process via `ort` (ONNX Runtime)
-- **Why:** no network hop, one binary, ONNX is the most common export format so most small classifiers (Kev, if exportable) run unchanged.
-- **Cost:** ONNX Runtime is C++; a crash in it kills the sidecar. Bigger binary.
-- **Rejected:** `candle` / `tract` (pure Rust but narrower model support), separate model server (extra process + hop; kept as `HttpModel` fallback).
-- **Revisit:** if chosen model runs in `candle`, drop the C++ dependency.
+### Kev via safetensors + `candle` (not ONNX)
+- **Why:** Kev ships safetensors (base, LoRA) and a PyTorch `head.pt`; candle reads both, is pure Rust, and uses Metal on Macs.
+- **Rejected:** ONNX/`ort` for Kev. Exporting Qwen3.5's Gated DeltaNet is unproven, and Kev runs one row per question, which a fixed export graph fights. `ort` stays only for `OnnxClassifier`.
+- **Cost:** candle has no Qwen3.5, so we port the backbone (tickets K1–K5) with parity tests against Kev's Python reference.
+- **Bridge:** until then, Kev's reference server on localhost + `KevHttp` (one local hop).
 
-### Parallel policy + model
-- **Why:** policy check is microseconds; running it first saves nothing. Parallel also logs both outcomes for threshold tuning.
-- **Honest limit:** model is still on the critical path. Sidecar latency ≈ model latency. Measure, don't claim "zero latency".
+### Latency
+- Model is on the critical path of every call. Sidecar latency ≈ model latency. Measure, don't claim "zero latency".
 
 ### Two model inputs, one batched call
 - `untrusted_inputs` → `injection_confidence` (does read content try to give orders?)

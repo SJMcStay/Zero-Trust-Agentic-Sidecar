@@ -1,0 +1,20 @@
+[package]
+name = "decision-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure-Rust regex backend: avoids building the C oniguruma library.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+# Pinned exactly: ort 2.0 is still a release candidate and its API changes between RCs.
+# download-binaries fetches a prebuilt ONNX Runtime for the target (macOS arm64/x86_64, Linux, Windows).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "copy-dylibs"] }
+# Async HTTP client for the local Kev server. No TLS: it only talks to localhost.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }

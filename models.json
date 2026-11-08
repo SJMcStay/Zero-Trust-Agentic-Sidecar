@@ -1,0 +1,19 @@
+{
+  "kev": {
+    "repo": "jaredpalmer/kev-0.8b",
+    "revision": "v1.0",
+    "dest": "models/kev",
+    "requires": ["qwen3.5-0.8b-base"],
+    "files": ["adapter_config.json", "adapter_model.safetensors", "head.pt", "tokenizer.json"],
+    "optional_files": ["tokenizer_config.json", "provenance.json"],
+    "weights_any_of": ["adapter_model.safetensors"]
+  },
+  "qwen3.5-0.8b-base": {
+    "repo": "Qwen/Qwen3.5-0.8B-Base",
+    "revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+    "dest": "models/qwen3.5-0.8b-base",
+    "files": ["config.json", "model.safetensors.index.json", "model.safetensors-00001-of-00001.safetensors"],
+    "optional_files": ["tokenizer.json", "tokenizer_config.json"],
+    "weights_any_of": ["model.safetensors-00001-of-00001.safetensors"]
+  }
+}

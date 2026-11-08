@@ -127,3 +127,6 @@ Desktop.ini
 /tmp/
 /scratch/
 *.tmp
+
+# Kev reference server checkout (scripts/kev_server.sh)
+/.kev-server/
