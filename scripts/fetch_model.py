@@ -34,6 +34,12 @@ HF = "https://huggingface.co"
 CHUNK = 1 << 20
 DISK_MARGIN = 1 << 30  # keep 1 GiB free after downloading
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+DEBUG = os.environ.get("ZT_DEBUG", "0") not in ("", "0")  # ZT_DEBUG=1: explain each step on stderr
+
+
+def debug(msg: str) -> None:
+    if DEBUG:
+        print(f"[debug] {msg}", file=sys.stderr, flush=True)
 
 
 def die(msg: str) -> None:
@@ -82,7 +88,9 @@ def api_json(url: str, token: str | None, what: str):
 def resolve_revision(repo: str, revision: str, token: str | None) -> str:
     """Commit sha for a branch or tag. Uses /refs: /revision/<tag> has returned main's sha for tags."""
     if COMMIT.match(revision):
+        debug(f"{repo}: revision {revision[:12]} is a commit sha, used as-is")
         return revision
+    debug(f"{repo}: resolving {revision!r} via {HF}/api/models/{repo}/refs")
     refs = api_json(f"{HF}/api/models/{repo}/refs", token, f"{repo} refs")
     for kind in ("branches", "tags"):
         for ref in refs.get(kind, []):
@@ -93,6 +101,7 @@ def resolve_revision(repo: str, revision: str, token: str | None) -> str:
 
 def remote_files(repo: str, revision: str, token: str | None) -> dict:
     """{filename: {"size": bytes, "sha256": lfs sha256 or None}} at this commit."""
+    debug(f"GET {HF}/api/models/{repo}/revision/{revision}?blobs=true (sizes + sha256)")
     meta = api_json(f"{HF}/api/models/{repo}/revision/{revision}?blobs=true", token, f"{repo}@{revision}")
     return {
         s["rfilename"]: {"size": s.get("size", 0), "sha256": (s.get("lfs") or {}).get("sha256")}
@@ -174,6 +183,7 @@ def fetch_one(name: str, cfg: dict, locks: dict, args: argparse.Namespace) -> No
         todo = [f for f, _ in wanted if not ok_on_disk(f)]
         need = sum(files[f]["size"] for f in todo)
         free = shutil.disk_usage(ROOT).free
+        debug(f"{name}: {len(todo)} of {len(wanted)} files to download, {need / 1e9:.2f} GB; {free / 1e9:.1f} GB free")
         if need + DISK_MARGIN > free:
             die(f"{name} needs {need / 1e9:.1f} GB, {free / 1e9:.1f} GB free (plus 1 GB margin). "
                 f"Free space (scripts/cleanup.sh) or pick a smaller model (kev-0.8b).")
@@ -182,6 +192,7 @@ def fetch_one(name: str, cfg: dict, locks: dict, args: argparse.Namespace) -> No
             if f not in todo:
                 print(f"  {f}: present")
                 continue
+            debug(f"GET {HF}/{repo}/resolve/{revision[:12]}/{f} -> {dest / f}")
             download(f"{HF}/{repo}/resolve/{revision}/{f}", dest / f, token)
             lfs = files[f]["sha256"]
             if lfs and sha256_file(dest / f) != lfs:
@@ -189,6 +200,8 @@ def fetch_one(name: str, cfg: dict, locks: dict, args: argparse.Namespace) -> No
                 die(f"{f}: sha256 differs from Hugging Face's; deleted. Retry, or check your network.")
 
     present = {f: sha256_file(dest / f) for f, _ in wanted if (dest / f).exists()}
+    for f, h in present.items():
+        debug(f"{name}/{f}: sha256 {h[:16]}… (lock: {((pin or {}).get('files', {}).get(f) or 'none')[:16]})")
     if not any(w in present for w in cfg.get("weights_any_of", [])):
         die(f"no weights in {dest}; expected one of {cfg.get('weights_any_of')}")
 

@@ -102,6 +102,21 @@ impl KevHttpEngine {
             })
             .collect();
         let body = json!({"state": state, "model": "kev-latest", "questions": questions_json});
+        let state_text = match state {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        tracing::debug!(
+            url = %self.systemone_url,
+            state_chars = state_text.chars().count(),
+            questions = ?questions.iter().map(|q| q.0).collect::<Vec<_>>(),
+            "KEV request"
+        );
+        tracing::trace!(
+            state = %crate::debug::preview(&state_text, crate::debug::PREVIEW_CHARS),
+            "KEV state preview"
+        );
+        let sent_at = std::time::Instant::now();
 
         let resp = self
             .client
@@ -123,6 +138,12 @@ impl KevHttpEngine {
         }
         let doc: Value = serde_json::from_str(&text)
             .map_err(|e| MlError::InferenceFailed(format!("Kev server sent invalid JSON: {e}")))?;
+        tracing::debug!(
+            answers = %doc.get("answers").map(|a| a.to_string()).unwrap_or_default(),
+            kev_ms = doc.get("latency_ms").and_then(|v| v.as_f64()).unwrap_or(-1.0),
+            round_trip_ms = sent_at.elapsed().as_millis() as u64,
+            "KEV answer"
+        );
 
         questions
             .iter()
@@ -150,7 +171,15 @@ impl KevHttpEngine {
         as_untrusted_inputs: bool,
     ) -> Result<f32, MlError> {
         let mut max = 0.0f32;
-        for chunk in window_text(text, STATE_WINDOW_CHARS, STATE_STRIDE_CHARS) {
+        let windows = window_text(text, STATE_WINDOW_CHARS, STATE_STRIDE_CHARS);
+        if windows.len() > 1 {
+            tracing::debug!(
+                windows = windows.len(),
+                chars = text.chars().count(),
+                "KEV long text split into windows"
+            );
+        }
+        for chunk in windows {
             let state = if as_untrusted_inputs {
                 json!({ "untrusted_inputs": [chunk] })
             } else {

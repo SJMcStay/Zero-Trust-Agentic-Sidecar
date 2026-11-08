@@ -122,11 +122,26 @@ pub fn locate_readout_indices(
 // 2. Hardware Device Selection
 // ==============================================================================
 
-/// Selects the optimal hardware acceleration device for Candle ML inference.
+/// Selects the hardware device for Candle ML inference (used by `KEV_ENGINE=candle`).
 ///
-/// Attempts Apple Silicon Metal GPU (device 0) if the `metal` feature is enabled.
-/// Gracefully falls back to CPU if Metal is unavailable, disabled, or fails.
+/// Tries NVIDIA CUDA (device 0) when built with `--features cuda`, then Apple Silicon Metal
+/// (device 0) when built with the default `metal` feature, then falls back to CPU.
 pub fn select_device() -> Device {
+    #[cfg(feature = "cuda")]
+    {
+        match Device::new_cuda(0) {
+            Ok(device) => {
+                tracing::info!("Initialized NVIDIA CUDA GPU acceleration (device 0)");
+                return device;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "CUDA acceleration requested but Device::new_cuda(0) failed: {err}. Trying the next device."
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "metal")]
     {
         match Device::new_metal(0) {
@@ -142,9 +157,9 @@ pub fn select_device() -> Device {
         }
     }
 
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
     {
-        tracing::info!("Metal feature disabled at compile time; utilizing CPU device.");
+        tracing::info!("No GPU feature compiled in (metal / cuda); utilizing CPU device.");
     }
 
     Device::Cpu
@@ -1335,6 +1350,7 @@ impl DecisionEngine for KevCandleEngine {
                         box_end_id,
                         fim_suffix_id,
                     )?;
+                    tracing::debug!(tokens = ids.len(), p_yes, "KEV candle window scored");
 
                     if p_yes > max_injection {
                         max_injection = p_yes;
@@ -1777,7 +1793,7 @@ mod tests {
     #[test]
     fn test_select_device_does_not_panic() {
         let dev = select_device();
-        assert!(dev.is_metal() || dev.is_cpu());
+        assert!(dev.is_metal() || dev.is_cuda() || dev.is_cpu());
     }
 
     #[test]

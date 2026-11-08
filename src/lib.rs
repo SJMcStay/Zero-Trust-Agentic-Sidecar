@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod config;
 pub mod crypto;
+pub mod debug;
 pub mod ml;
 pub mod policy;
 pub mod routes;

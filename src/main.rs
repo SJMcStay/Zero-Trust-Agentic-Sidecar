@@ -1,7 +1,6 @@
 //! Zero-Trust Agentic Sidecar Server Entrypoint (`src/main.rs`)
 
 use std::sync::Arc;
-use tracing_subscriber::EnvFilter;
 use zero_trust_agentic_sidecar::{
     create_router, kev_dirs_from_manifest, resolve_kev_artifacts, select_device, AppState,
     AuditLogger, Config, DecisionEngine, KevCandleEngine, KevEngineKind, KevHttpEngine, MlError,
@@ -11,11 +10,9 @@ use zero_trust_agentic_sidecar::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize tracing subscriber
+    // ZT_DEBUG=1 / 2 turns on per-step debug output (see src/debug.rs); RUST_LOG overrides.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "zero_trust_agentic_sidecar=info,axum=info".into()),
-        )
+        .with_env_filter(zero_trust_agentic_sidecar::debug::log_filter())
         .init();
 
     tracing::info!("Initializing Zero-Trust Agentic Sidecar...");
@@ -31,6 +28,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         "Configuration loaded. Target bind address: {}",
         config.sidecar_addr
+    );
+    tracing::debug!(
+        engine = ?config.kev_engine,
+        kev_url = %config.kev_url,
+        kev_model = %config.kev_model,
+        upstream = %config.upstream_llm_url,
+        backend = %config.flask_backend_url,
+        policy = ?config.policy_path,
+        anthropic_api_key = if config.anthropic_api_key.is_some() { "set" } else { "not set" },
+        "startup config (secrets never printed)"
     );
 
     // 3. Initialize structured JSONL audit logger with secret redaction
@@ -51,6 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         "Deterministic policy engine loaded from {:?}",
         config.policy_path
+    );
+    let d = policy_engine.defaults();
+    tracing::debug!(
+        max_injection = d.max_injection_confidence,
+        max_intent = d.max_malicious_intent,
+        model_timeout_ms = d.model_timeout_ms,
+        fail_closed = d.fail_closed,
+        "policy thresholds"
     );
 
     // 5. Initialize the DecisionEngine chosen by KEV_ENGINE. Fail closed: if it cannot start,
@@ -124,7 +139,8 @@ async fn init_decision_engine(
             tracing::warn!(
                 "KEV_ENGINE=synthetic: deterministic toy graph, not Kev. Tests and demos only."
             );
-            Ok(Arc::new(SyntheticKevEngine::new()?))
+            // CPU: the toy graph is tiny, and Metal kernel warm-up can exceed its 500 ms budget.
+            Ok(Arc::new(SyntheticKevEngine::for_cpu()?))
         }
     }
 }

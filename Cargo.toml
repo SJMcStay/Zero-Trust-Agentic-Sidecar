@@ -10,9 +10,15 @@ authors = ["Zero-Trust Sidecar Team"]
 name = "zero_trust_agentic_sidecar"
 path = "src/lib.rs"
 
+# GPU for the in-process Candle engine (KEV_ENGINE=candle). The default http engine does not
+# need either: Kev's own server picks MLX (Apple Silicon) or CUDA (NVIDIA) by itself.
+#   macOS:        cargo build                                        (metal)
+#   Linux:        cargo build --no-default-features                  (CPU; metal does not build on Linux)
+#   Linux + CUDA: cargo build --no-default-features --features cuda  (needs the CUDA toolkit)
 [features]
 default = ["metal"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dependencies]
 anyhow = "1.0"

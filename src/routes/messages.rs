@@ -188,6 +188,24 @@ pub async fn messages_handler(
         }
     };
 
+    tracing::debug!(
+        bytes = body.len(),
+        model = json_val
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
+        messages = json_val
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map_or(0, |m| m.len()),
+        stream = json_val
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        anthropic_beta = headers.contains_key("anthropic-beta"),
+        "A1 request received"
+    );
+
     // 2. Extract full prompt text across system and messages
     let prompt_text = match extract_prompt_text_from_json(&json_val) {
         Ok(txt) => txt,
@@ -224,7 +242,17 @@ pub async fn messages_handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    tracing::debug!(
+        chars = prompt_text.chars().count(),
+        "A2 text to score: system prompt + every message (see proposals/score-new-content.md)"
+    );
+    tracing::trace!(
+        preview = %crate::debug::preview(&prompt_text, crate::debug::PREVIEW_CHARS),
+        "A2 text preview"
+    );
+
     // 3. Risk Evaluation via DecisionEngine with timeout
+    let model_start = Instant::now();
     let timeout_dur =
         std::time::Duration::from_millis(state.policy_engine.defaults().model_timeout_ms);
     let eval_res = tokio::time::timeout(
@@ -235,6 +263,11 @@ pub async fn messages_handler(
 
     let verdict = match eval_res {
         Err(_) => {
+            tracing::debug!(
+                timeout_ms = timeout_dur.as_millis() as u64,
+                engine = state.decision_engine.model_id(),
+                "A3 model timed out -> deny (fail closed)"
+            );
             let latency_ms = start_time.elapsed().as_millis() as u64;
             let _ = state.audit_logger.log(AuditEntry {
                 timestamp: chrono::Utc::now(),
@@ -261,6 +294,7 @@ pub async fn messages_handler(
                 .into_response();
         }
         Ok(Err(ml_err)) => {
+            tracing::debug!(error = %ml_err, "A3 model error -> deny (fail closed)");
             let latency_ms = start_time.elapsed().as_millis() as u64;
             let _ = state.audit_logger.log(AuditEntry {
                 timestamp: chrono::Utc::now(),
@@ -286,7 +320,16 @@ pub async fn messages_handler(
             )
                 .into_response();
         }
-        Ok(Ok(v)) => v,
+        Ok(Ok(v)) => {
+            tracing::debug!(
+                injection = v.injection_confidence,
+                intent = v.malicious_intent,
+                engine = %v.model_id,
+                model_ms = model_start.elapsed().as_millis() as u64,
+                "A3 model verdict"
+            );
+            v
+        }
     };
 
     // 4. Threshold Checking (injection_confidence >= 0.70 or malicious_intent >= 0.50)
@@ -294,6 +337,13 @@ pub async fn messages_handler(
     let max_intent = state.policy_engine.defaults().max_malicious_intent;
 
     if verdict.injection_confidence >= max_injection || verdict.malicious_intent >= max_intent {
+        tracing::debug!(
+            injection = verdict.injection_confidence,
+            max_injection,
+            intent = verdict.malicious_intent,
+            max_intent,
+            "A4 deny: score at or above threshold -> 403 to the agent"
+        );
         let latency_ms = start_time.elapsed().as_millis() as u64;
         let _ = state.audit_logger.log(AuditEntry {
             timestamp: chrono::Utc::now(),
@@ -321,6 +371,11 @@ pub async fn messages_handler(
     }
 
     // 5. Audit log Allowed Verdict
+    tracing::debug!(
+        max_injection,
+        max_intent,
+        "A4 allow: scores below thresholds"
+    );
     let latency_ms = start_time.elapsed().as_millis() as u64;
     let _ = state.audit_logger.log(AuditEntry {
         timestamp: chrono::Utc::now(),
@@ -352,10 +407,16 @@ pub async fn messages_handler(
     if let Some(beta) = headers.get("anthropic-beta") {
         req = req.header("anthropic-beta", beta);
     }
+    tracing::debug!(
+        url = %target_url,
+        api_key = if state.config.anthropic_api_key.is_some() { "sidecar key" } else { "none (client credentials are not forwarded)" },
+        "A5 forwarding to the LLM API"
+    );
 
     let upstream_resp = match req.body(body).send().await {
         Ok(resp) => resp,
         Err(err) => {
+            tracing::debug!(error = %err, "A5 LLM API unreachable -> 502");
             let err_body = AnthropicErrorEnvelope::api_error(format!(
                 "Upstream Anthropic connection failure: {err}"
             ));
@@ -369,6 +430,12 @@ pub async fn messages_handler(
     };
 
     let status = upstream_resp.status();
+    tracing::debug!(
+        status = status.as_u16(),
+        stream,
+        total_ms = start_time.elapsed().as_millis() as u64,
+        "A6 LLM API answered; relaying to the agent"
+    );
 
     // If upstream returns error status code, pass it through directly
     if !status.is_success() {

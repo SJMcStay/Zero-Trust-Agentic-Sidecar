@@ -7,6 +7,7 @@
 #   scripts/cleanup.sh --all         # all of the above
 #   add --dry-run to only list, --yes to skip the prompt
 set -euo pipefail
+[ "${ZT_DEBUG:-0}" != 0 ] && set -x   # ZT_DEBUG=1: print each command as it runs
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HF_HUB="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
 
