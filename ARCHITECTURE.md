@@ -12,7 +12,7 @@ Agent CLI ──Route A: POST /v1/messages──► Sidecar :8080 ──(safe, x
           ──Route B: POST /api/execute───►   │        ──(allowed, HMAC-signed)────► Flask backend :5000
                                              │
                                              └──► Kev decision model (this machine)
-                                                  KEV_ENGINE=http   → Kev reference server 127.0.0.1:8008 (default)
+                                                  KEV_ENGINE=http   → Kev reference server 127.0.0.1:8008 (default; MLX or CUDA)
                                                   KEV_ENGINE=candle → in-process Rust port (experimental)
 ```
 
@@ -29,7 +29,7 @@ Breaking any of these compromises the zero-trust posture.
 5. **Cryptographic choke point.** Agent → sidecar: JWT (`Authorization: Bearer`). Sidecar → backend: `X-Sidecar-Signature = hex(HMAC-SHA256(SIDECAR_SECRET, ts + "." + body))`; the backend rejects unsigned, tampered or stale (> 30 s) requests with 401.
 6. **Fail closed.** Missing secrets, invalid policy, malformed payloads, bad JWTs, model errors or timeouts → 403 (or no start). A decision engine that cannot start stops the sidecar; there is no fallback to the synthetic engine.
 7. **Never block the Tokio runtime.** In-process inference runs in `spawn_blocking` behind a semaphore.
-8. **Audit without leaks.** One JSON line per decision (route, caller, scores, rule, latency); API keys and argument values are redacted.
+8. **Audit without leaks.** One JSON line per decision (route, caller, scores, rule, latency); API keys and argument values are redacted. The one exception is opt-in and local: `ZT_DEBUG=2` previews text and payloads for debugging.
 
 ---
 
@@ -61,5 +61,13 @@ Breaking any of these compromises the zero-trust posture.
 - **Why:** prompt-injection accuracy on Kev's evaluation-only source is 0.753 for 4B vs 0.547 for 0.8B (Jev: 0.893), per the model cards.
 - **Cost:** 4B needs ~12 GB while serving and 9.3 GB of base weights. `KEV_MODEL=kev-0.8b` swaps in the small model.
 
-### 3.7 Python Flask target backend (`backend/app.py`, `:5000`)
+### 3.7 MLX on Apple Silicon, CUDA on NVIDIA
+- **Why:** Kev's server already has both paths: MLX (Metal) on Apple Silicon, and PyTorch bf16 with CUDA graphs and fused Qwen3.5 kernels (`flash-linear-attention==0.5.2`) on NVIDIA. `scripts/kev_server.sh` detects the machine and installs the kernels on CUDA boxes.
+- **Candle engine:** `metal` feature (default, macOS only) or `cuda` feature (Linux; needs the CUDA toolkit). Linux builds use `--no-default-features`.
+- **Cost:** two GPU stacks to keep working; the CUDA path is untested until someone runs it on an NVIDIA machine.
+
+### 3.8 Debug output behind `ZT_DEBUG`
+- **Why:** see each step of real traffic (inputs, Kev scores, the deciding rule, forward target, timings) instead of a scripted demo. Off by default; `ZT_DEBUG=2` adds text previews, which can contain secrets, so it is for local debugging only.
+
+### 3.9 Python Flask target backend (`backend/app.py`, `:5000`)
 - **Why:** simulates internal services with safe (`/api/v1/system/status`) and dangerous (`/api/v1/db/drop`) endpoints, and enforces the signature check so a compromised agent cannot call it directly.

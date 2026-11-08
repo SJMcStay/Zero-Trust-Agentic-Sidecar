@@ -23,15 +23,18 @@
 | `src/policy.rs` | `policy.toml` loader and deterministic rule evaluation |
 | `src/crypto.rs` | JWT verification (agent → sidecar), HMAC-SHA256 signing (sidecar → backend) |
 | `src/audit.rs` | JSON-lines audit log with secret redaction |
+| `src/debug.rs` | `ZT_DEBUG` switch for per-step debug output |
 | `src/ml/mod.rs` | `DecisionEngine` trait, windowing, verdict pooling |
 | `src/ml/kev_http.rs` | `KevHttpEngine`: asks the local Kev server (default engine) |
 | `src/ml/kev.rs` | Candle engine (experimental), local artifact resolution, synthetic test engine |
+| **proposals/** | |
+| `proposals/score-new-content.md` | R1: score only what is new in each turn |
+| `proposals/alerts-and-agents.md` | Pop-up alerts, in-protocol answers, agent-agnostic adapters, path to a real CLI |
 | **scripts/** | |
 | `scripts/init.sh` | One-time, re-runnable setup |
 | `scripts/fetch_model.py` | Downloads a `models.json` model into `models/`, pinned and sha256-verified |
-| `scripts/kev_server.sh` | Kev reference server on `127.0.0.1:8008`, offline, reading `models/` |
+| `scripts/kev_server.sh` | Kev reference server on `127.0.0.1:8008` (MLX or CUDA), offline, reading `models/` |
 | `scripts/cleanup.sh` | Deletes generated files; lists sizes and asks first |
-| `scripts/trace.sh` | Runs mock LLM + backend + sidecar and prints decisions, latency and audit lines |
 | `scripts/mint_jwt.py` | Mints an agent JWT for calling Route B by hand |
 | **backend/** | |
 | `backend/app.py` | Flask target backend on `:5000`; rejects unsigned requests |

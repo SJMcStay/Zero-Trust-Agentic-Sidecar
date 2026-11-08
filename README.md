@@ -38,7 +38,7 @@ Kev runs on this machine: its reference server on `127.0.0.1:8008` (default) or 
 - **Client/Agent Layer**: Claude Code CLI (or local Qwen via Ollama), pointed at the proxy with `ANTHROPIC_BASE_URL="http://localhost:8080"`.
 - **Security Proxy (The Core)**: Rust: Axum (HTTP routing), Tokio (async runtime), Reqwest (HTTP client). Listens on `localhost:8080`.
 - **Decision Model**: Kev, a LoRA adapter + pointer head on Qwen3.5. Default `kev-4b` (32 GB machines); `kev-0.8b` for 16 GB machines. Weights are pinned and sha256-verified (`models.json`, `models.lock.json`) and never downloaded at runtime.
-- **Model Engine** (`KEV_ENGINE`): `http` (default) asks Kev's reference server on `127.0.0.1:8008` (MLX on Apple Silicon); `candle` runs an in-process Rust port that is experimental and not yet Kev-equivalent (see `ARCHITECTURE.md`).
+- **Model Engine** (`KEV_ENGINE`): `http` (default) asks Kev's reference server on `127.0.0.1:8008` (MLX on Apple Silicon, CUDA on NVIDIA); `candle` runs an in-process Rust port that is experimental and not yet Kev-equivalent (see `ARCHITECTURE.md`).
 - **Target Backend API**: Python Flask application. Listens on `localhost:5000` (`5001` in `.env.example`: macOS AirPlay holds 5000). Simulates internal enterprise tools with safe endpoints (`/api/v1/system/status`) and vulnerable endpoints (`/api/v1/db/drop`).
 
 ### 2. Data Flow & Routing Logic
@@ -74,6 +74,7 @@ set -a && . ./.env && set +a && cargo run --release   # terminal 2: sidecar on :
 | [`FILES.md`](FILES.md) | What each file does |
 | [`design-doc.md`](design-doc.md) | Request flows, contracts, Kev engine, tickets |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Invariants and decisions, with reasons |
+| [`proposals/`](proposals/) | Next steps: scoring only new content; pop-up alerts and other agents |
 
 ## License
 MIT

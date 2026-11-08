@@ -147,7 +147,7 @@ Kev = LoRA adapter + pointer head on Qwen3.5 (hybrid backbone: three Gated Delta
 
 | Engine (`KEV_ENGINE`) | Runs | Status |
 | --- | --- | --- |
-| `http` (default) | Kev reference server, `scripts/kev_server.sh`, `127.0.0.1:8008` | Real Kev answers (MLX on Apple Silicon) |
+| `http` (default) | Kev reference server, `scripts/kev_server.sh`, `127.0.0.1:8008` | Real Kev answers (MLX on Apple Silicon, CUDA on NVIDIA) |
 | `candle` | In-process, `src/ml/kev.rs` | Experimental, Kev-0.8B shapes only, not Kev-equivalent ([ARCHITECTURE 3.2](./ARCHITECTURE.md)) |
 | `synthetic` | In-process toy graph | Tests and demos |
 
@@ -238,7 +238,7 @@ With real Kev use `policy.local.toml` (written by `scripts/init.sh`, `model_time
 
 File map: [FILES.md](./FILES.md). Run steps: [USAGE.md](./USAGE.md).
 
-Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPSTREAM_LLM_URL` · `FLASK_BACKEND_URL` · `SIDECAR_SECRET` (required) · `JWT_SECRET` (required) · `POLICY_PATH` · `KEV_ENGINE` · `KEV_URL` · `KEV_MODEL` · `RUST_LOG`
+Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPSTREAM_LLM_URL` · `FLASK_BACKEND_URL` · `SIDECAR_SECRET` (required) · `JWT_SECRET` (required) · `POLICY_PATH` · `KEV_ENGINE` · `KEV_URL` · `KEV_MODEL` · `ZT_DEBUG` (1: step output, 2: + text previews) · `RUST_LOG`
 
 ## Tickets
 
@@ -248,8 +248,11 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 | K2 | Candle: partial RoPE (64 of 256 dims, θ = 1e7), per-head q/gate split, plain-weight gated RMSNorm | hidden states match the reference |
 | K3 | Candle: Kev encoder parity (no `\n` separators, one row per question) + golden probabilities from the Kev server | within 0.02 of the server on fixtures |
 | K4 | Candle: BF16 weights on Metal, shapes from `config.json` (Kev-4B) | kev-4b loads and passes K3 |
-| R1 | Route A: score only new untrusted content (latest `tool_result` blocks), not the system prompt + full history every turn | a Claude Code session stays under the timeout |
+| R1 | Route A: score only new content ([proposal](proposals/score-new-content.md)) | a 50-turn Claude Code session stays under the timeout |
 | R2 | Route A: buffer and score outbound `tool_use` blocks in streamed responses | recorded-stream test |
+| G1 | Claude Code gateway compliance: `/v1/messages?beta=true`, pass through `count_tokens`, `/v1/models`, `HEAD /api/hello`, all `anthropic-*` headers ([proposal](proposals/alerts-and-agents.md)) | Claude Code runs a session through the sidecar |
+| AL1–AL3 | Answer the agent in its own protocol instead of a 403; alert stream `GET /v1/alerts`; pop-up app; optional allow-once | blocked call shows a pop-up and the agent continues |
+| AD1–AD3 | Adapters: OpenAI-compatible (Ollama, LM Studio, vLLM), Codex (Responses API), Gemini | same verdicts and alerts for each agent |
 | E1 | Eval fixtures (benign / injected prompts and tool calls); precision/recall for kev-0.8b vs kev-4b; set thresholds | numbers in ARCHITECTURE 3.6 |
 | E2 | Latency per route on team Macs; set `model_timeout_ms` | numbers in ARCHITECTURE 3.4 |
 
@@ -258,3 +261,5 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 - Kev-4B on 16 GB Macs: does MLX serving fit next to an IDE? If not, those machines use kev-0.8b.
 - Route A scores Claude Code's own instruction-heavy system prompt every turn: expect false positives and timeouts until R1.
 - Thresholds 0.70 / 0.50 are not yet validated against Kev's scores (E1).
+- Codex and Antigravity: confirm each can point at a custom base URL (AD2, AD3).
+- CUDA path (Kev server on NVIDIA, `--features cuda`) is untested: no NVIDIA machine yet.
