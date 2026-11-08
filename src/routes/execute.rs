@@ -137,7 +137,7 @@ pub async fn execute_handler(
     tracing::trace!(
         payload = %crate::debug::preview(
             &serde_json::to_string(&req.payload).unwrap_or_default(),
-            crate::debug::PREVIEW_CHARS
+            crate::debug::preview_chars()
         ),
         "B1 payload preview"
     );
@@ -180,7 +180,9 @@ pub async fn execute_handler(
     // =========================================================================
     // Step 3: Parallel Evaluation via tokio::join!
     // =========================================================================
-    let policy_engine = Arc::clone(&state.policy_engine);
+    // Snapshot of the live policy (reloaded when the file changes), used for the whole request.
+    let policy_snapshot = state.current_policy();
+    let policy_engine = Arc::clone(&policy_snapshot);
     let decision_engine = Arc::clone(&state.decision_engine);
     let claims_clone = claims.clone();
     let req_policy = req.clone();
@@ -262,7 +264,7 @@ pub async fn execute_handler(
     // =========================================================================
     // Priority 8: ML Risk Score High / Model Unavailable
     // =========================================================================
-    let defaults = state.policy_engine.defaults();
+    let defaults = policy_snapshot.defaults();
 
     if ml_timed_out_or_failed && defaults.fail_closed {
         tracing::debug!("B5 deny: model unavailable and fail_closed -> 403");
@@ -354,8 +356,7 @@ pub async fn execute_handler(
         &outbound_payload_bytes,
     );
 
-    let target_path = state
-        .policy_engine
+    let target_path = policy_snapshot
         .backend_url_for(&req.endpoint)
         .and_then(|u| {
             if let Some(pos) = u.find("://") {
@@ -377,7 +378,7 @@ pub async fn execute_handler(
                 format!("/{target_path}")
             }
         )
-    } else if let Some(url) = state.policy_engine.backend_url_for(&req.endpoint) {
+    } else if let Some(url) = policy_snapshot.backend_url_for(&req.endpoint) {
         url.to_string()
     } else {
         format!(

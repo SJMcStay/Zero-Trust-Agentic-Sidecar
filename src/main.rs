@@ -88,13 +88,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // 7. Assemble shared AppState & Axum Router
+    // Edits to the policy file apply without a restart (checked at most once a second;
+    // a broken edit keeps the last good policy).
+    let live_policy = Arc::new(zero_trust_agentic_sidecar::LivePolicy::new(
+        config.policy_path.clone(),
+        Arc::clone(&policy_engine),
+    ));
     let state = AppState::new(
         config.clone(),
         policy_engine,
         decision_engine,
         audit_logger,
         http_client,
-    );
+    )
+    .with_live_policy(live_policy);
     let app = create_router(state);
 
     // 8. Bind TCP listener

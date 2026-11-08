@@ -4,8 +4,9 @@
 
 pub mod execute;
 pub mod messages;
+pub mod upstream;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
@@ -18,7 +19,13 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{audit::AuditLogger, config::Config, ml::DecisionEngine, policy::PolicyEngine};
+use crate::{
+    audit::AuditLogger,
+    config::Config,
+    ml::DecisionEngine,
+    policy::{LivePolicy, PolicyEngine},
+    turn::BlockedMemory,
+};
 
 pub use execute::execute_handler;
 pub use messages::messages_handler;
@@ -31,6 +38,10 @@ pub struct AppState {
     pub decision_engine: Arc<dyn DecisionEngine>,
     pub audit_logger: Arc<AuditLogger>,
     pub http_client: reqwest::Client,
+    /// Re-reads the policy file when it changes (set by `main.rs`; `None` in tests).
+    pub live_policy: Option<Arc<LivePolicy>>,
+    /// Content blocked earlier in a conversation (Route A `remember_blocked`).
+    pub blocked: Arc<Mutex<BlockedMemory>>,
 }
 
 impl AppState {
@@ -48,6 +59,22 @@ impl AppState {
             decision_engine,
             audit_logger,
             http_client,
+            live_policy: None,
+            blocked: Arc::new(Mutex::new(BlockedMemory::default())),
+        }
+    }
+
+    /// Re-read the policy file when it changes on disk.
+    pub fn with_live_policy(mut self, live: Arc<LivePolicy>) -> Self {
+        self.live_policy = Some(live);
+        self
+    }
+
+    /// The policy for this request: the live (reloaded) one when set, else the startup one.
+    pub fn current_policy(&self) -> Arc<PolicyEngine> {
+        match &self.live_policy {
+            Some(live) => live.current(),
+            None => Arc::clone(&self.policy_engine),
         }
     }
 
@@ -69,6 +96,8 @@ impl AppState {
             decision_engine,
             audit_logger: Arc::new(audit_logger),
             http_client,
+            live_policy: None,
+            blocked: Arc::new(Mutex::new(BlockedMemory::default())),
         }
     }
 
@@ -151,6 +180,17 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/v1/messages", post(messages::messages_handler))
+        // Relayed unscored for Claude Code (LLM-gateway guide); see routes/upstream.rs.
+        .route(
+            "/v1/messages/count_tokens",
+            post(upstream::passthrough_handler),
+        )
+        .route("/v1/models", get(upstream::passthrough_handler))
+        .route("/v1/models/:id", get(upstream::passthrough_handler))
+        .route(
+            "/api/hello",
+            get(upstream::passthrough_handler).head(upstream::passthrough_handler),
+        )
         .route("/api/execute", post(execute::execute_handler))
         .layer(axum::middleware::from_fn(trace_middleware))
         .layer(axum::middleware::from_fn(cors_middleware))

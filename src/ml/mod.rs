@@ -72,6 +72,13 @@ pub trait DecisionEngine: Send + Sync {
 
     /// Evaluates structured tool execution requests (outbound Route B calls).
     async fn evaluate_tool_call(&self, req: &ToolExecuteRequest) -> Result<KevVerdict, MlError>;
+
+    /// Scores the new content of one agent turn (Route A with `score = "new"`). Engines that
+    /// take a single string get the turn rendered as text; `KevHttpEngine` overrides this to
+    /// send Kev a structured state.
+    async fn evaluate_turn(&self, turn: &crate::turn::NewTurn) -> Result<KevVerdict, MlError> {
+        self.evaluate_prompt(&turn.to_text()).await
+    }
 }
 
 // ==============================================================================

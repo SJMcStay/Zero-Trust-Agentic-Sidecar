@@ -15,7 +15,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::types::{AgentClaims, DefaultPolicy, DenyRule, PolicyConfig, ToolExecuteRequest};
+use crate::turn::TurnRules;
+use crate::types::{
+    AgentClaims, AlertPolicy, DefaultPolicy, DenyRule, PolicyConfig, RouteAPolicy,
+    ToolExecuteRequest,
+};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Errors encountered while loading, parsing, or validating policy definitions.
 #[derive(Debug, Error)]
@@ -82,6 +88,8 @@ pub struct PolicyEngine {
     config: PolicyConfig,
     /// Pre-compiled endpoints indexed by target endpoint path for O(1) lookup.
     compiled_endpoints: HashMap<String, CompiledEndpointRule>,
+    /// `[route_a]` patterns compiled, for reading new turns.
+    turn_rules: TurnRules,
 }
 
 impl PolicyEngine {
@@ -121,6 +129,39 @@ impl std::str::FromStr for PolicyEngine {
                 config.defaults.max_malicious_intent
             )));
         }
+
+        if config.route_a.context_chars > 20_000 {
+            return Err(PolicyError::ValidationError(format!(
+                "route_a.context_chars must be at most 20000, got {}",
+                config.route_a.context_chars
+            )));
+        }
+        let compile = |field: &str, patterns: &[String]| {
+            patterns
+                .iter()
+                .map(|pat| {
+                    Regex::new(pat).map_err(|e| {
+                        PolicyError::ValidationError(format!(
+                            "route_a.{field}: invalid regex '{pat}': {e}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let route_a = &config.route_a;
+        let turn_rules = TurnRules {
+            skip: compile("skip_patterns", &route_a.skip_patterns)?,
+            tool_output_skip: compile(
+                "tool_output_skip_patterns",
+                &route_a.tool_output_skip_patterns,
+            )?,
+            inline_tool_output: compile(
+                "inline_tool_output_patterns",
+                &route_a.inline_tool_output_patterns,
+            )?,
+            include_user_text: route_a.include_user_text,
+            context_chars: route_a.context_chars,
+        };
 
         let mut compiled_endpoints = HashMap::with_capacity(config.endpoints.len());
 
@@ -166,7 +207,75 @@ impl std::str::FromStr for PolicyEngine {
         Ok(Self {
             config,
             compiled_endpoints,
+            turn_rules,
         })
+    }
+}
+
+/// A policy file that is re-read when it changes on disk, so users can adjust settings
+/// without restarting. Checks the file's modification time at most once per second.
+/// A broken edit keeps the last good policy (and logs why): settings never fail open.
+pub struct LivePolicy {
+    path: PathBuf,
+    current: RwLock<Arc<PolicyEngine>>,
+    seen_modified: Mutex<Option<SystemTime>>,
+    last_check: Mutex<Instant>,
+}
+
+impl LivePolicy {
+    pub const CHECK_EVERY: Duration = Duration::from_secs(1);
+
+    pub fn new(path: impl Into<PathBuf>, initial: Arc<PolicyEngine>) -> Self {
+        let path = path.into();
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        Self {
+            path,
+            current: RwLock::new(initial),
+            seen_modified: Mutex::new(modified),
+            last_check: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// The policy to use for this request; reloads first if the file changed.
+    pub fn current(&self) -> Arc<PolicyEngine> {
+        let due = {
+            let mut last = self.last_check.lock().unwrap_or_else(|e| e.into_inner());
+            let due = last.elapsed() >= Self::CHECK_EVERY;
+            if due {
+                *last = Instant::now();
+            }
+            due
+        };
+        if due {
+            self.reload_if_changed();
+        }
+        Arc::clone(&self.current.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Reloads when the modification time differs from the last one seen. Returns true on reload.
+    pub fn reload_if_changed(&self) -> bool {
+        let modified = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut seen = self.seen_modified.lock().unwrap_or_else(|e| e.into_inner());
+        if modified.is_none() || modified == *seen {
+            return false;
+        }
+        *seen = modified;
+        match PolicyEngine::from_file(&self.path) {
+            Ok(engine) => {
+                *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(engine);
+                tracing::info!("Policy reloaded from {:?}", self.path);
+                true
+            }
+            Err(err) => {
+                tracing::error!(
+                    "Policy file {:?} changed but is invalid; keeping the previous policy: {err}",
+                    self.path
+                );
+                false
+            }
+        }
     }
 }
 
@@ -179,6 +288,21 @@ impl PolicyEngine {
     /// Returns a reference to global default thresholds and settings.
     pub fn defaults(&self) -> &DefaultPolicy {
         &self.config.defaults
+    }
+
+    /// `[route_a]` settings: scoring scope, mode, block response.
+    pub fn route_a(&self) -> &RouteAPolicy {
+        &self.config.route_a
+    }
+
+    /// `[route_a]` patterns and options for reading a new turn.
+    pub fn turn_rules(&self) -> &TurnRules {
+        &self.turn_rules
+    }
+
+    /// `[alerts]` settings.
+    pub fn alerts(&self) -> &AlertPolicy {
+        &self.config.alerts
     }
 
     /// Retrieves pre-compiled endpoint rule for an exact endpoint path.
@@ -821,5 +945,18 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn repo_policy_documents_the_route_a_and_alert_defaults() {
+        let engine = PolicyEngine::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/policy.toml"))
+            .expect("policy.toml must load");
+        assert_eq!(
+            engine.route_a(),
+            &RouteAPolicy::default(),
+            "policy.toml [route_a] drifted from the defaults"
+        );
+        assert_eq!(engine.alerts(), &AlertPolicy::default());
+        assert_eq!(engine.turn_rules().inline_tool_output.len(), 1);
     }
 }

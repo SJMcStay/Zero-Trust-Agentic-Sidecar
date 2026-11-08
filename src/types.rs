@@ -358,6 +358,96 @@ pub struct PolicyConfig {
     pub defaults: DefaultPolicy,
     #[serde(default)]
     pub endpoints: HashMap<String, EndpointRule>,
+    /// Route A (`/v1/messages`) scoring and blocking behaviour. Optional section.
+    #[serde(default)]
+    pub route_a: RouteAPolicy,
+    /// How the human is told about blocks. Optional section.
+    #[serde(default)]
+    pub alerts: AlertPolicy,
+}
+
+/// Whether a decision blocks or is only reported.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EnforcementMode {
+    /// Block requests that cross a threshold.
+    #[default]
+    Enforce,
+    /// Never block: log, alert and forward. For tuning thresholds on real traffic.
+    Monitor,
+}
+
+/// Which part of a `/v1/messages` request is scored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScoreScope {
+    /// System prompt and every message, every turn (strict, slow on long sessions).
+    #[default]
+    All,
+    /// Only what arrived since the model's last turn: new tool results and user text.
+    New,
+}
+
+/// What the agent receives when Route A blocks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockResponse {
+    /// HTTP 403 with an Anthropic error body: the agent's turn fails.
+    #[default]
+    Error,
+    /// HTTP 200 with an assistant message explaining the block: the agent shows it and stops.
+    Message,
+}
+
+/// `[route_a]` section of `policy.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RouteAPolicy {
+    pub mode: EnforcementMode,
+    pub score: ScoreScope,
+    /// With `score = "new"`: also score text the human typed in the new turn.
+    pub include_user_text: bool,
+    /// Regexes for harness-written text removed before scoring (e.g. Claude Code's
+    /// `<system-reminder>` blocks). Compiled at load; an invalid pattern rejects the policy.
+    pub skip_patterns: Vec<String>,
+    /// Regexes for exact harness text appended to tool outputs. Keep these exact: a generic
+    /// pattern lets a poisoned file or page hide an injection from the model.
+    pub tool_output_skip_patterns: Vec<String>,
+    /// Regexes for user text blocks that hold tool output inlined by the harness (Claude Code
+    /// `@file` mentions). Such a block is scored whole as tool output; skip patterns ignored.
+    /// An optional `(?P<tool>...)` group names the tool.
+    pub inline_tool_output_patterns: Vec<String>,
+    /// Characters of the user's latest request sent to the model as context.
+    pub context_chars: usize,
+    pub on_block: BlockResponse,
+    /// Keep blocking a conversation that still contains content blocked earlier.
+    pub remember_blocked: bool,
+}
+
+impl Default for RouteAPolicy {
+    fn default() -> Self {
+        Self {
+            mode: EnforcementMode::Enforce,
+            score: ScoreScope::All,
+            include_user_text: true,
+            skip_patterns: vec![r"(?s)<system-reminder>.*?</system-reminder>".to_string()],
+            tool_output_skip_patterns: Vec::new(),
+            inline_tool_output_patterns: vec![
+                r"Result of calling the (?P<tool>\w+) tool".to_string()
+            ],
+            context_chars: 1000,
+            on_block: BlockResponse::Error,
+            remember_blocked: true,
+        }
+    }
+}
+
+/// `[alerts]` section of `policy.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct AlertPolicy {
+    /// Native desktop notification (macOS / Linux) when something is blocked or flagged.
+    pub desktop: bool,
 }
 
 /// Global operational thresholds and invariants.

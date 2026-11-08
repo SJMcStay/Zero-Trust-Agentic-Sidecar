@@ -10,17 +10,22 @@ Rust security proxy (`localhost:8080`) between an AI agent CLI (Claude Code / lo
 
 ```text
 Agent CLI (Claude Code / Qwen)
-  │  POST http://localhost:8080/v1/messages
+  │  POST http://localhost:8080/v1/messages?beta=true
   ▼
-[Axum Route A Handler]
-  ├─► Parse Anthropic/Chat messages payload (extract user & tool_result blocks)
-  ├─► Score with Kev (engine per KEV_ENGINE; reference server by default):
-  │     • injection_confidence (overlapping windows over prompt / tool_result text)
-  ├─► Evaluate thresholds (injection_confidence < max_injection, malicious_intent < max_intent)
-  │     ├─► FAIL (≥ threshold or model error) ──► 403 Forbidden (JSON error + Audit Log)
-  │     └─► PASS (< threshold)
-  │           ├─► Inject `x-api-key: $ANTHROPIC_API_KEY` inside Rust memory
-  │           └─► Forward via Reqwest to `https://api.anthropic.com/v1/messages` (streams response back)
+[Axum Route A Handler]          (policy file re-read when it changes)
+  ├─► What to score ([route_a] score):
+  │     • "new": tool results, inlined @files and typed text since the model's last turn;
+  │       harness <system-reminder> text skipped, tool output never skipped
+  │     • "all": system prompt and every message
+  ├─► Conversation still carries content blocked earlier? ──► block (remember_blocked)
+  ├─► Kev: injection_confidence (one state; overlapping windows for long turns)
+  ├─► Thresholds
+  │     ├─► FAIL (≥ threshold, model error or timeout)
+  │     │     ├─► mode = "monitor": log + alert, forward anyway
+  │     │     └─► audit + desktop alert ──► 403, or an assistant message the agent shows (on_block)
+  │     └─► PASS ──► forward unchanged (body, anthropic-* headers, query) with the sidecar's
+  │                  x-api-key or the agent's own login; stream the response back
+Relayed unscored: POST /v1/messages/count_tokens · GET /v1/models · HEAD|GET /api/hello
 ```
 
 ### Route B: Outbound Tool Execution (`POST /api/execute`)
@@ -238,7 +243,7 @@ With real Kev use `policy.local.toml` (written by `scripts/init.sh`, `model_time
 
 File map: [FILES.md](./FILES.md). Run steps: [USAGE.md](./USAGE.md).
 
-Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPSTREAM_LLM_URL` · `FLASK_BACKEND_URL` · `SIDECAR_SECRET` (required) · `JWT_SECRET` (required) · `POLICY_PATH` · `KEV_ENGINE` · `KEV_URL` · `KEV_MODEL` · `ZT_DEBUG` (1: step output, 2: + text previews) · `RUST_LOG`
+Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPSTREAM_LLM_URL` · `FLASK_BACKEND_URL` · `SIDECAR_SECRET` (required) · `JWT_SECRET` (required) · `POLICY_PATH` · `KEV_ENGINE` · `KEV_URL` · `KEV_MODEL` · `ZT_DEBUG` (1: step output, 2: + text previews, 3: full text) · `RUST_LOG`
 
 ## Tickets
 
@@ -248,10 +253,11 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 | K2 | Candle: partial RoPE (64 of 256 dims, θ = 1e7), per-head q/gate split, plain-weight gated RMSNorm | hidden states match the reference |
 | K3 | Candle: Kev encoder parity (no `\n` separators, one row per question) + golden probabilities from the Kev server | within 0.02 of the server on fixtures |
 | K4 | Candle: BF16 weights on Metal, shapes from `config.json` (Kev-4B) | kev-4b loads and passes K3 |
-| R1 | Route A: score only new content ([proposal](proposals/score-new-content.md)) | a 50-turn Claude Code session stays under the timeout |
+| R1 | Done (`score = "new"`): score only new content ([proposal](proposals/score-new-content.md)). Left: time a 50-turn session | a 50-turn Claude Code session stays under the timeout |
 | R2 | Route A: buffer and score outbound `tool_use` blocks in streamed responses | recorded-stream test |
-| G1 | Claude Code gateway compliance: `/v1/messages?beta=true`, pass through `count_tokens`, `/v1/models`, `HEAD /api/hello`, all `anthropic-*` headers ([proposal](proposals/alerts-and-agents.md)) | Claude Code runs a session through the sidecar |
-| AL1–AL3 | Answer the agent in its own protocol instead of a 403; alert stream `GET /v1/alerts`; pop-up app; optional allow-once | blocked call shows a pop-up and the agent continues |
+| G1 | Done: Claude Code gateway compliance: `/v1/messages?beta=true`, pass through `count_tokens`, `/v1/models`, `HEAD /api/hello`, all `anthropic-*` headers ([proposal](proposals/alerts-and-agents.md)) | Claude Code runs a session through the sidecar |
+| AL1 | Done (`on_block = "message"`, `[alerts] desktop`): answer in the agent's protocol; desktop notification | blocked call shows a pop-up and the agent shows why |
+| AL2–AL3 | Alert stream `GET /v1/alerts` for a tray app; optional allow-once | allow-once lets one blocked call through |
 | AD1–AD3 | Adapters: OpenAI-compatible (Ollama, LM Studio, vLLM), Codex (Responses API), Gemini | same verdicts and alerts for each agent |
 | E1 | Eval fixtures (benign / injected prompts and tool calls); precision/recall for kev-0.8b vs kev-4b; set thresholds | numbers in ARCHITECTURE 3.6 |
 | E2 | Latency per route on team Macs; set `model_timeout_ms` | numbers in ARCHITECTURE 3.4 |
@@ -259,7 +265,8 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 ## Open
 
 - Kev-4B on 16 GB Macs: does MLX serving fit next to an IDE? If not, those machines use kev-0.8b.
-- Route A scores Claude Code's own instruction-heavy system prompt every turn: expect false positives and timeouts until R1.
-- Thresholds 0.70 / 0.50 are not yet validated against Kev's scores (E1).
+- Thresholds 0.70 / 0.50 are not yet validated against Kev's scores (E1). Kev-0.8B scored an obvious injection ~0.6: calibrate in `mode = "monitor"` before enforcing.
+- CORS allows any origin (`tests/test_routes.rs` asserts it). With `ANTHROPIC_API_KEY` set in the sidecar, a web page could spend that key through `localhost`. Restrict origins before holding a real key; with the agent's own login passing through there is no key to spend.
+- `remember_blocked` is in memory: a restart forgets blocked content.
 - Codex and Antigravity: confirm each can point at a custom base URL (AD2, AD3).
 - CUDA path (Kev server on NVIDIA, `--features cuda`) is untested: no NVIDIA machine yet.

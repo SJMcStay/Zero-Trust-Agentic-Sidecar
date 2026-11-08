@@ -22,12 +22,12 @@ Agent CLI ──Route A: POST /v1/messages──► Sidecar :8080 ──(safe, x
 
 Breaking any of these compromises the zero-trust posture.
 
-1. **Dual-route interception.** Route A scores prompts (incl. `tool_result` blocks) before they reach the LLM. Route B checks tool calls (policy + Kev) before any backend is touched.
+1. **Dual-route interception.** Route A scores untrusted content (tool results, inlined files, typed text) before it reaches the LLM. Route B checks tool calls (policy + Kev) before any backend is touched.
 2. **Local-only decision model.** Kev runs on this machine. Weights are pinned to a commit and sha256-verified (`models.json`, `models.lock.json`) and only ever downloaded by `scripts/fetch_model.py`; the sidecar and the Kev server read them offline.
-3. **Zero secret exposure.** `ANTHROPIC_API_KEY`, `SIDECAR_SECRET` and `JWT_SECRET` live only in the sidecar process. The agent only knows `ANTHROPIC_BASE_URL=http://localhost:8080`.
+3. **Zero secret exposure.** `ANTHROPIC_API_KEY`, `SIDECAR_SECRET` and `JWT_SECRET` live only in the sidecar process. The agent only knows `ANTHROPIC_BASE_URL=http://localhost:8080`. With no `ANTHROPIC_API_KEY` set, the agent's own login passes through unchanged.
 4. **Deterministic policy decides, Kev advises.** Kev returns calibrated probabilities; fixed thresholds and `policy.toml` rules turn them into reproducible allow/deny decisions.
 5. **Cryptographic choke point.** Agent → sidecar: JWT (`Authorization: Bearer`). Sidecar → backend: `X-Sidecar-Signature = hex(HMAC-SHA256(SIDECAR_SECRET, ts + "." + body))`; the backend rejects unsigned, tampered or stale (> 30 s) requests with 401.
-6. **Fail closed.** Missing secrets, invalid policy, malformed payloads, bad JWTs, model errors or timeouts → 403 (or no start). A decision engine that cannot start stops the sidecar; there is no fallback to the synthetic engine.
+6. **Fail closed.** Missing secrets, invalid policy, malformed payloads, bad JWTs, model errors or timeouts → deny (or no start). A decision engine that cannot start stops the sidecar; there is no fallback to the synthetic engine. An invalid policy edit keeps the last good policy.
 7. **Never block the Tokio runtime.** In-process inference runs in `spawn_blocking` behind a semaphore.
 8. **Audit without leaks.** One JSON line per decision (route, caller, scores, rule, latency); API keys and argument values are redacted. The one exception is opt-in and local: `ZT_DEBUG=2` previews text and payloads for debugging.
 
@@ -51,7 +51,7 @@ Breaking any of these compromises the zero-trust posture.
 
 ### 3.4 Deterministic zero-trust policy (`policy.toml`)
 - **Why:** models can be nudged by adversarial input. Route B pairs Kev with hard rules: JWT/role check, endpoint allowlist, required arguments, linear-time `regex` and `max_len` constraints, Kev thresholds.
-- **Timeout:** `policy.toml` keeps `model_timeout_ms = 500` (tests depend on it). Real Kev needs more; `scripts/init.sh` writes `policy.local.toml` with 5000 ms.
+- **Timeout:** `policy.toml` keeps `model_timeout_ms = 500` and conservative Route A defaults (tests depend on them). `scripts/init.sh` writes `policy.local.toml` with 5000 ms, `score = "new"`, `on_block = "message"` and desktop alerts.
 
 ### 3.5 Pinned, verified model artifacts (`models.json` + `models.lock.json`)
 - **Why:** a security control should not change under you. Every file is pinned to a Hub commit and checked by sha256; Hugging Face's own LFS hashes are checked on download too.
@@ -67,7 +67,25 @@ Breaking any of these compromises the zero-trust posture.
 - **Cost:** two GPU stacks to keep working; the CUDA path is untested until someone runs it on an NVIDIA machine.
 
 ### 3.8 Debug output behind `ZT_DEBUG`
-- **Why:** see each step of real traffic (inputs, Kev scores, the deciding rule, forward target, timings) instead of a scripted demo. Off by default; `ZT_DEBUG=2` adds text previews, which can contain secrets, so it is for local debugging only.
+- **Why:** see each step of real traffic (inputs, Kev scores, the deciding rule, forward target, timings) instead of a scripted demo. Off by default; `ZT_DEBUG=2` adds text previews and `ZT_DEBUG=3` the full scored text, which can contain secrets, so both are for local debugging only.
 
 ### 3.9 Python Flask target backend (`backend/app.py`, `:5000`)
 - **Why:** simulates internal services with safe (`/api/v1/system/status`) and dangerous (`/api/v1/db/drop`) endpoints, and enforces the signature check so a compromised agent cannot call it directly.
+
+### 3.10 Score only the new turn (`[route_a] score = "new"`)
+- **Why:** agents resend the whole conversation every call. Scoring all of it grows with the session, blows the timeout, and flags the harness's own instruction-heavy system prompt. Only content after the model's last turn is new: tool results and what the human typed. Kev also gets the user's latest request and the tool call as context.
+- **Skip patterns** (Claude Code's `<system-reminder>` text) apply to user text only. Tool output is always scored, so a file cannot hide an injection inside a fake reminder. Tool output the harness inlines into user text (`@file`: "Result of calling the Read tool") is scored whole.
+- **Remembered blocks:** after a block, the agent resends the blocked content as history. Its sha256 is remembered, so the conversation stays blocked until `/rewind` or `/clear`. Only scored untrusted pieces are remembered, never harness text or (when tool output is present) the human's words, which recur across sessions.
+- **Cost:** the system prompt, CLAUDE.md and earlier turns are trusted once seen.
+- **Rejected:** KV cache or embeddings of earlier turns: a turn's new content is small, so stateless extraction is enough.
+
+### 3.11 Transparent gateway for Claude Code
+- **Why:** Claude Code's LLM-gateway rules: never rewrite the body (thinking signatures and prompt caching depend on it), forward `anthropic-*` headers and the query (`?beta=true`), relay upstream headers (`request-id`, `x-should-retry`, rate limits).
+- **Relayed unscored:** `count_tokens`, `/v1/models`, `/api/hello`; no model turn comes out of them. No catch-all: with a sidecar-held key, every Anthropic endpoint would be open to any local process.
+- **Credentials:** the sidecar's `ANTHROPIC_API_KEY` replaces the agent's; with none, the agent's own login (claude.ai OAuth) passes through.
+
+### 3.12 Blocks the agent can show; alerts; live policy
+- **`on_block = "message"`:** a 403 ends the turn as `API Error`. An assistant message (JSON or SSE) is shown verbatim and says what was blocked and how to recover.
+- **Desktop alert** (`osascript` / `notify-send`, at most one per 3 s): the human sees it whichever agent is running.
+- **`mode = "monitor"`:** never block, only log and alert, to calibrate thresholds on real traffic first.
+- **Live policy:** the file is re-checked at most once a second; edits apply without a restart.

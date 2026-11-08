@@ -5,6 +5,25 @@ model_timeout_ms = 500
 fail_closed = true
 require_jwt = true
 
+# Route A (/v1/messages, e.g. Claude Code). Edits apply within a second, no restart; an invalid
+# edit is rejected and the last good policy stays. Values below are the defaults.
+[route_a]
+mode = "enforce"           # "monitor": never block, only log and alert (for tuning thresholds)
+score = "all"              # "new": only what arrived since the model's last turn (tool results, typed text)
+include_user_text = true   # with score = "new": also score what the human typed
+on_block = "error"         # "message": answer with an assistant message the agent shows, instead of HTTP 403
+remember_blocked = true    # keep blocking a conversation that still carries blocked content
+context_chars = 1000       # characters of the user's latest request sent to Kev as context
+# Harness text removed from user text before scoring. Never applied to tool results.
+skip_patterns = ['(?s)<system-reminder>.*?</system-reminder>']
+# User text that is really tool output (Claude Code inlines @file mentions): scored whole.
+inline_tool_output_patterns = ['Result of calling the (?P<tool>\w+) tool']
+# Exact harness text appended to tool results. Keep exact: a loose pattern hides injections.
+tool_output_skip_patterns = []
+
+[alerts]
+desktop = false            # native notification when something is blocked or flagged
+
 [endpoints."/api/v1/system/status"]
 backend_url = "http://127.0.0.1:5000/api/v1/system/status"
 enabled = true

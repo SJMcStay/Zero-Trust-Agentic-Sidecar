@@ -1,6 +1,6 @@
 # Proposal: alert the human, keep the agent talking, work with any agent
 
-Status: proposal, tickets G1, AL1–AL3, AD1–AD3 in [design-doc.md](../design-doc.md).
+Status: G1 and AL1 implemented (`on_block = "message"`, `[alerts] desktop`); AL2–AL3 and AD1–AD3 open in [design-doc.md](../design-doc.md).
 
 ## Today
 

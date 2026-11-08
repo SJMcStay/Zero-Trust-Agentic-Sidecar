@@ -1,6 +1,6 @@
 # Proposal: score only new content (Route A)
 
-Status: proposal, ticket R1 in [design-doc.md](../design-doc.md).
+Status: implemented as `[route_a] score = "new"` (`src/turn.rs`); decisions in [ARCHITECTURE.md](../ARCHITECTURE.md) 3.10.
 
 ## Problem
 

@@ -56,15 +56,19 @@ for key, value in values.items():
 open(".env", "w").write(env)
 EOF
   chmod 600 .env
-  echo "wrote .env (set ANTHROPIC_API_KEY in it for Route A)"
+  echo "wrote .env (Claude Code's own login is used; set ANTHROPIC_API_KEY to have the sidecar hold a key)"
 fi
 
-step "policy.local.toml (real-model timeout; policy.toml keeps 500 ms for the tests)"
+step "policy.local.toml (your settings; policy.toml keeps the defaults the tests use)"
 if [ -f policy.local.toml ]; then
   echo "policy.local.toml exists; leaving it"
 else
-  sed 's/^model_timeout_ms = .*/model_timeout_ms = 5000/' policy.toml > policy.local.toml
-  echo "wrote policy.local.toml (model_timeout_ms = 5000; raise it if you see model_unavailable)"
+  # Real Kev needs more than 500 ms; agents need only the new turn scored and a readable block.
+  sed -e 's/^model_timeout_ms = .*/model_timeout_ms = 5000/' \
+      -e 's/^score = "all"/score = "new"/' \
+      -e 's/^on_block = "error"/on_block = "message"/' \
+      -e 's/^desktop = false/desktop = true/' policy.toml > policy.local.toml
+  echo "wrote policy.local.toml (score = new, on_block = message, desktop alerts, 5 s timeout)"
 fi
 
 step "Model weights ($KEV_MODEL, pinned + sha256-verified)"
@@ -87,4 +91,5 @@ Done. Run (see USAGE.md):
   scripts/kev_server.sh                                              # 1: Kev on 127.0.0.1:8008
   set -a && . ./.env && set +a && .venv/bin/python backend/app.py   # 2: backend on :5000
   set -a && . ./.env && set +a && cargo run --release $CARGO_FLAGS  # 3: sidecar on :8080
+  scripts/claude.sh                                                  # 4: Claude Code through the sidecar
 EOF

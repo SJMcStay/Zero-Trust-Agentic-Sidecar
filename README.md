@@ -12,6 +12,7 @@ The **Zero-Trust Agentic Sidecar** is a Rust proxy between a local LLM agent and
 - **Deterministic Policy Enforcement**: Evaluates every requested action against explicit, zero-trust security rules before execution.
 - **Cryptographic Authorization**: Verifies caller identity, permissions, and payload integrity prior to forwarding requests.
 - **Fail closed**: missing secrets, a bad policy, a model timeout or a model that cannot start all mean deny (or no start).
+- **Claude Code as is**: `scripts/claude.sh` points it at the sidecar. Kev scores only what is new each turn (tool results, `@files`, typed text); a block shows up as Claude Code's reply plus a desktop notification. `policy.local.toml` edits apply without a restart.
 
 ## Project Architecture: Enterprise AI Gateway
 
@@ -46,8 +47,8 @@ Kev runs on this machine: its reference server on `127.0.0.1:8008` (default) or 
 #### Route A: Inbound Message Gateway (Client -> LLM)
 - **Endpoint**: `POST /v1/messages` (Proxy port `8080`)
 - **Interception**: Axum catches the chat request from the agent CLI.
-- **ML Evaluation**: The prompt text (system, messages, `tool_result` blocks) is scored by Kev for prompt injection.
-- **Forwarding**: If safe (probability < threshold), the proxy injects the real `x-api-key` and forwards to `https://api.anthropic.com/v1/messages`, streaming the response back.
+- **ML Evaluation**: Kev scores what is new since the model's last turn (`score = "new"`) or the whole prompt (`score = "all"`) for prompt injection.
+- **Forwarding**: If safe (probability < threshold), the request goes unchanged to `https://api.anthropic.com/v1/messages` with the sidecar's `x-api-key` (or the agent's own login) and the response streams back. If not, the agent gets a 403 or an assistant message explaining the block (`on_block`).
 
 #### Route B: Outbound Tool Execution (LLM -> Backend)
 - **Endpoint**: `POST /api/execute` (Proxy port `8080`)
@@ -57,7 +58,7 @@ Kev runs on this machine: its reference server on `127.0.0.1:8008` (default) or 
 
 ### 3. Deployment & Security Posture
 - Runs entirely locally: the proxy, Kev and the backend. Only Route A's forward to the LLM API leaves the machine.
-- API secrets are injected inside the Rust process; the agent never sees them.
+- API secrets are injected inside the Rust process; the agent never sees them. With no key set, the agent's own login passes through.
 - Kev-4B needs ~12 GB of memory while serving; use `KEV_MODEL=kev-0.8b` on 16 GB machines.
 
 ## Getting Started
@@ -66,6 +67,7 @@ Kev runs on this machine: its reference server on `127.0.0.1:8008` (default) or 
 scripts/init.sh                       # once: tools, .env with fresh secrets, verified weights, Kev server, build
 scripts/kev_server.sh                 # terminal 1: Kev on 127.0.0.1:8008
 set -a && . ./.env && set +a && cargo run --release   # terminal 2: sidecar on :8080
+scripts/claude.sh                     # terminal 3: Claude Code through the sidecar
 ```
 
 | Doc | Read for |
@@ -74,7 +76,7 @@ set -a && . ./.env && set +a && cargo run --release   # terminal 2: sidecar on :
 | [`FILES.md`](FILES.md) | What each file does |
 | [`design-doc.md`](design-doc.md) | Request flows, contracts, Kev engine, tickets |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Invariants and decisions, with reasons |
-| [`proposals/`](proposals/) | Next steps: scoring only new content; pop-up alerts and other agents |
+| [`proposals/`](proposals/) | Design notes: scoring only new content (done); alerts and other agents |
 
 ## License
 MIT
