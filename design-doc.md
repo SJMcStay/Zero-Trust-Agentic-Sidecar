@@ -242,8 +242,8 @@ Env (`.env`, from `.env.example`): `SIDECAR_ADDR` · `ANTHROPIC_API_KEY` · `UPS
 | R2 | Route A: buffer and score outbound `tool_use` blocks in streamed responses | recorded-stream test |
 | G1 | Done: Claude Code gateway compliance: `/v1/messages?beta=true`, pass through `count_tokens`, `/v1/models`, `HEAD /api/hello`, all `anthropic-*` headers ([proposal](proposals/alerts-and-agents.md)) | Claude Code runs a session through the sidecar |
 | AL1 | Done (`on_block = "message"`, `[alerts] desktop`): answer in the agent's protocol; desktop notification | blocked call shows a pop-up and the agent shows why |
-| AL2–AL3 | Alert stream `GET /v1/alerts` for a tray app; optional allow-once | allow-once lets one blocked call through |
-| M5 | Done: merge of #5 (strict schema, per-endpoint / per-tool overrides, `[tools]`, CLI mappings, redaction, config validation, prefill) with #6 | `cargo test` green, Claude Code verified through `scripts/agent.sh` |
+| AL2–AL3 | Done (#7, extended to Route A): authenticated in-memory alert stream `GET /v1/alerts`, `scripts/alert_notifier.py`, one-time "Allow once / Block" approval for borderline scores on Route A and B | stream + native notifier; no notifier or timeout blocks; approval applies once |
+| M5 | Done: merge of #5 (strict schema, per-endpoint / per-tool overrides, `[tools]`, CLI mappings, redaction, config validation, prefill) with #6, then #7 | `cargo test` green, Claude Code verified through `scripts/agent.sh` |
 | H1 | Claude Code `PreToolUse` hook that sends each Bash / Edit / WebFetch call to `/api/execute` (`[tools]`) and blocks on deny; realistic `bash` rule | a dangerous Bash command is stopped before it runs |
 | AD1–AD3 | Adapters: OpenAI-compatible (Ollama, LM Studio, vLLM), Codex (Responses API), Gemini | same verdicts and alerts for each agent |
 | E1 | Eval fixtures (benign / injected prompts and tool calls); precision/recall for kev-0.8b vs kev-4b; set thresholds | numbers in ARCHITECTURE 3.6 |

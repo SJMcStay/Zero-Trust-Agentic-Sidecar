@@ -21,7 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     alerts,
@@ -277,6 +277,8 @@ pub async fn messages_handler(
                         &model_name,
                         block,
                         None,
+                        &Caller::from(&headers),
+                        false,
                     );
                 }
             }
@@ -379,9 +381,13 @@ pub async fn messages_handler(
     };
 
     if let Some(block) = block {
+        let caller = Caller::from(&headers);
         if route_a.mode == EnforcementMode::Monitor {
             tracing::debug!(rule = ?block.rule, reason = %block.reason, "A4 monitor mode: would block, forwarding");
-            if policy.alerts().desktop {
+            let mut alert = caller.alert(&block, new_turn, false);
+            alert.action = "monitor".into();
+            state.alert_hub.publish(alert);
+            if policy.alerts().desktop && !state.alert_hub.has_listeners() {
                 alerts::desktop(
                     "Zero-Trust Sidecar (monitor)",
                     &format!("Would block: {}", block.reason),
@@ -397,6 +403,38 @@ pub async fn messages_handler(
             );
             return forward_to_llm(&state, &uri, &headers, body, stream).await;
         }
+
+        // Just over the threshold: ask the human once (scripts/alert_notifier.py), if listening.
+        let defaults = policy.defaults();
+        let borderline = matches!(block.rule, DenyRule::ModelRiskHigh)
+            && defaults.human_approval_timeout_ms > 0
+            && block.verdict.as_ref().is_some_and(|v| {
+                alerts::near_threshold(
+                    v.injection_confidence,
+                    max_injection,
+                    defaults.human_approval_band,
+                )
+            });
+        if borderline {
+            let alert = caller.alert(&block, new_turn, true);
+            let wait = Duration::from_millis(defaults.human_approval_timeout_ms);
+            tracing::debug!(
+                wait_ms = wait.as_millis() as u64,
+                "A4 borderline score: asking the human"
+            );
+            if state.alert_hub.request_approval(alert, wait).await {
+                tracing::debug!("A4 human allowed this request once -> forwarding");
+                audit(
+                    &state,
+                    start_time,
+                    "allow",
+                    None,
+                    Some(alerts::HUMAN_ALLOWED_ONCE.to_string()),
+                    block.verdict.as_ref(),
+                );
+                return forward_to_llm(&state, &uri, &headers, body, stream).await;
+            }
+        }
         return blocked(
             &state,
             &route_a,
@@ -406,6 +444,8 @@ pub async fn messages_handler(
             &model_name,
             block,
             new_turn,
+            &caller,
+            borderline,
         );
     }
 
@@ -447,6 +487,62 @@ fn request_shape(body: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The calling agent, for alerts.
+struct Caller {
+    agent: String,
+    session: Option<String>,
+}
+
+impl Caller {
+    fn from(headers: &HeaderMap) -> Self {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        Self {
+            agent: get("user-agent").unwrap_or_else(|| "unknown".to_string()),
+            session: get("x-claude-code-session-id"),
+        }
+    }
+
+    /// Alert for `block`; the target names what carried the injection (`Read {"file_path":...}`).
+    fn alert(&self, block: &Block, turn: Option<&NewTurn>, approval: bool) -> alerts::Alert {
+        let target = match turn {
+            Some(t) if !t.tool_results.is_empty() => t
+                .tool_results
+                .iter()
+                .map(|r| {
+                    if r.input.is_empty() {
+                        r.tool.clone()
+                    } else {
+                        format!("{} {}", r.tool, crate::turn::truncate(&r.input, 120))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(_) => "the new user text".to_string(),
+            None => "the prompt".to_string(),
+        };
+        let rule = serde_json::to_value(block.rule)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        alerts::new_alert(
+            &self.agent,
+            self.session.clone(),
+            "POST /v1/messages",
+            &target,
+            &rule,
+            &block.reason,
+            block.verdict.as_ref().map(|v| v.injection_confidence),
+            block.verdict.as_ref().map(|v| v.malicious_intent),
+            approval,
+        )
+    }
 }
 
 /// "the Read result (/repo/notes.md)" / "the new user text" for block explanations.
@@ -506,6 +602,8 @@ fn blocked(
     model: &str,
     block: Block,
     turn: Option<&NewTurn>,
+    caller: &Caller,
+    alerted: bool,
 ) -> Response {
     tracing::debug!(rule = ?block.rule, reason = %block.reason, on_block = ?route_a.on_block, "A4 deny");
     let explanation =
@@ -523,7 +621,10 @@ fn blocked(
             memory.remember(&turn.piece_hashes);
         }
     }
-    if policy.alerts().desktop {
+    if !alerted {
+        state.alert_hub.publish(caller.alert(&block, turn, false));
+    }
+    if policy.alerts().desktop && !state.alert_hub.has_listeners() {
         alerts::desktop("Zero-Trust Sidecar blocked a request", &explanation);
     }
     match route_a.on_block {

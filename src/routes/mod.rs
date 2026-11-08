@@ -20,6 +20,7 @@ use axum::{
 use serde_json::json;
 
 use crate::{
+    alerts::AlertHub,
     audit::AuditLogger,
     config::Config,
     ml::DecisionEngine,
@@ -42,6 +43,8 @@ pub struct AppState {
     pub live_policy: Option<Arc<LivePolicy>>,
     /// Content blocked earlier in a conversation (Route A `remember_blocked`).
     pub blocked: Arc<Mutex<BlockedMemory>>,
+    /// Recent alerts and pending human approvals (`GET /v1/alerts`).
+    pub alert_hub: AlertHub,
 }
 
 impl AppState {
@@ -61,6 +64,7 @@ impl AppState {
             http_client,
             live_policy: None,
             blocked: Arc::new(Mutex::new(BlockedMemory::default())),
+            alert_hub: AlertHub::default(),
         }
     }
 
@@ -98,6 +102,7 @@ impl AppState {
             http_client,
             live_policy: None,
             blocked: Arc::new(Mutex::new(BlockedMemory::default())),
+            alert_hub: AlertHub::default(),
         }
     }
 
@@ -192,6 +197,8 @@ pub fn create_router(state: AppState) -> Router {
             get(upstream::passthrough_handler).head(upstream::passthrough_handler),
         )
         .route("/api/execute", post(execute::execute_handler))
+        .route("/v1/alerts", get(crate::alerts::stream))
+        .route("/v1/alerts/:id/decision", post(crate::alerts::decide))
         .layer(axum::middleware::from_fn(trace_middleware))
         .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(state)

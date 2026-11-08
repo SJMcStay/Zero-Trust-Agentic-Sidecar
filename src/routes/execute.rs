@@ -262,6 +262,20 @@ pub async fn execute_handler(
     // Priority 3 through 7: Deterministic Policy Failures
     // =========================================================================
     if let Err(policy_deny) = policy_result {
+        state.alert_hub.publish(crate::alerts::new_alert(
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown"),
+            Some(req.session_id.clone()),
+            "POST /api/execute",
+            &req.endpoint,
+            policy_deny.rule,
+            &policy_deny.message,
+            ml_verdict.as_ref().map(|v| v.injection_confidence),
+            ml_verdict.as_ref().map(|v| v.malicious_intent),
+            false,
+        ));
         tracing::debug!(rule = policy_deny.rule, "B5 deny: policy rule -> 403");
         let latency_ms = start_time.elapsed().as_millis() as u64;
         let mut err_resp = ExecuteErrorResponse::new(
@@ -297,8 +311,23 @@ pub async fn execute_handler(
     // Priority 8: ML Risk Score High / Model Unavailable
     // =========================================================================
     let defaults = policy_snapshot.defaults();
+    let mut approved_by_human = false;
 
     if ml_timed_out_or_failed && defaults.fail_closed {
+        state.alert_hub.publish(crate::alerts::new_alert(
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown"),
+            Some(req.session_id.clone()),
+            "POST /api/execute",
+            &req.endpoint,
+            "model_unavailable",
+            "Model evaluation timed out or failed",
+            None,
+            None,
+            false,
+        ));
         tracing::debug!("B5 deny: model unavailable and fail_closed -> 403");
         let latency_ms = start_time.elapsed().as_millis() as u64;
         let mut err_resp = ExecuteErrorResponse::new(
@@ -334,41 +363,78 @@ pub async fn execute_handler(
         if verdict.injection_confidence >= effective_max_inj
             || verdict.malicious_intent >= effective_max_intent
         {
-            tracing::debug!(
-                injection = verdict.injection_confidence,
-                max_injection = effective_max_inj,
-                intent = verdict.malicious_intent,
-                max_intent = effective_max_intent,
-                "B5 deny: model score at or above threshold -> 403"
-            );
-            let latency_ms = start_time.elapsed().as_millis() as u64;
-            let mut err_resp = ExecuteErrorResponse::new(
-                "ModelRiskHigh",
-                "ml_risk",
-                "Model risk threshold exceeded",
-                Some("Model risk threshold exceeded".to_string()),
-                ml_scores,
-            );
-            err_resp.sanitize(state.audit_logger.known_secrets());
-
-            let entry = AuditEntry {
-                timestamp: chrono::Utc::now(),
-                route: "POST /api/execute".to_string(),
-                session_id: Some(req.session_id.clone()),
-                caller_sub: Some(claims.sub.clone()),
-                caller_role: Some(claims.role.clone()),
-                target_endpoint: Some(req.endpoint.clone()),
-                method: Some(req.method.clone()),
-                decision: "deny".to_string(),
-                matched_rule: Some(DenyRule::ModelRiskHigh),
-                reason: Some("Model risk threshold exceeded".to_string()),
-                injection_confidence: Some(verdict.injection_confidence),
-                malicious_intent: Some(verdict.malicious_intent),
-                latency_ms,
+            // Just over the threshold: ask the human (scripts/alert_notifier.py) when one is
+            // listening. Every score that is over must be within the band.
+            let band = defaults.human_approval_band;
+            let within = |score: f32, max: f32| {
+                score < max || crate::alerts::near_threshold(score, max, band)
             };
-            let _ = state.audit_logger.log(entry);
+            let approval_timeout = defaults.human_approval_timeout_ms;
+            let ask = approval_timeout > 0
+                && within(verdict.injection_confidence, effective_max_inj)
+                && within(verdict.malicious_intent, effective_max_intent);
+            let alert = crate::alerts::new_alert(
+                headers
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown"),
+                Some(req.session_id.clone()),
+                "POST /api/execute",
+                &req.endpoint,
+                "model_risk_high",
+                "Kev score is at or above the configured threshold",
+                Some(verdict.injection_confidence),
+                Some(verdict.malicious_intent),
+                ask,
+            );
+            let approved_once = if ask {
+                state
+                    .alert_hub
+                    .request_approval(alert, Duration::from_millis(approval_timeout))
+                    .await
+            } else {
+                state.alert_hub.publish(alert);
+                false
+            };
+            if !approved_once {
+                tracing::debug!(
+                    injection = verdict.injection_confidence,
+                    max_injection = effective_max_inj,
+                    intent = verdict.malicious_intent,
+                    max_intent = effective_max_intent,
+                    "B5 deny: model score at or above threshold -> 403"
+                );
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                let mut err_resp = ExecuteErrorResponse::new(
+                    "ModelRiskHigh",
+                    "ml_risk",
+                    "Model risk threshold exceeded",
+                    Some("Model risk threshold exceeded".to_string()),
+                    ml_scores,
+                );
+                err_resp.sanitize(state.audit_logger.known_secrets());
 
-            return (StatusCode::FORBIDDEN, Json(err_resp)).into_response();
+                let entry = AuditEntry {
+                    timestamp: chrono::Utc::now(),
+                    route: "POST /api/execute".to_string(),
+                    session_id: Some(req.session_id.clone()),
+                    caller_sub: Some(claims.sub.clone()),
+                    caller_role: Some(claims.role.clone()),
+                    target_endpoint: Some(req.endpoint.clone()),
+                    method: Some(req.method.clone()),
+                    decision: "deny".to_string(),
+                    matched_rule: Some(DenyRule::ModelRiskHigh),
+                    reason: Some("Model risk threshold exceeded".to_string()),
+                    injection_confidence: Some(verdict.injection_confidence),
+                    malicious_intent: Some(verdict.malicious_intent),
+                    latency_ms,
+                };
+                let _ = state.audit_logger.log(entry);
+
+                return (StatusCode::FORBIDDEN, Json(err_resp)).into_response();
+            }
+            tracing::debug!("B5 human allowed this borderline call once");
+            approved_by_human = true;
         }
     }
 
@@ -402,7 +468,7 @@ pub async fn execute_handler(
             method: Some(req.method.clone()),
             decision: "allow".to_string(),
             matched_rule: None,
-            reason: None,
+            reason: approved_by_human.then(|| crate::alerts::HUMAN_ALLOWED_ONCE.to_string()),
             injection_confidence: ml_verdict.as_ref().map(|v| v.injection_confidence),
             malicious_intent: ml_verdict.as_ref().map(|v| v.malicious_intent),
             latency_ms,
@@ -565,7 +631,7 @@ pub async fn execute_handler(
         method: Some(req.method.clone()),
         decision: "allow".to_string(),
         matched_rule: None,
-        reason: None,
+        reason: approved_by_human.then(|| crate::alerts::HUMAN_ALLOWED_ONCE.to_string()),
         injection_confidence: ml_verdict.as_ref().map(|v| v.injection_confidence),
         malicious_intent: ml_verdict.as_ref().map(|v| v.malicious_intent),
         latency_ms,
@@ -577,6 +643,17 @@ pub async fn execute_handler(
 
 /// Emits HTTP 401 Unauthorized response and records audit log.
 fn emit_unauthorized(state: &AppState, req: &ToolExecuteRequest, start_time: Instant) -> Response {
+    state.alert_hub.publish(crate::alerts::new_alert(
+        "unknown",
+        Some(req.session_id.clone()),
+        "POST /api/execute",
+        &req.endpoint,
+        "unauthorized_token",
+        "Missing or invalid bearer token",
+        None,
+        None,
+        false,
+    ));
     let latency_ms = start_time.elapsed().as_millis() as u64;
     let resp = UnauthorizedResponse {
         error: "unauthorized".to_string(),

@@ -7,6 +7,10 @@
 max_injection_confidence = 0.70   # block at or above this Kev P(prompt injection)
 max_malicious_intent = 0.50       # Route B: block at or above this Kev P(harmful tool call)
 model_timeout_ms = 500            # Kev must answer within this, else deny (tests rely on 500)
+# Borderline model blocks (score at or above the threshold by at most the band) wait for the
+# human's "Allow once" / "Block" in scripts/alert_notifier.py; no notifier or no answer = block.
+human_approval_timeout_ms = 15000 # 0 disables; at most 60000
+human_approval_band = 0.10        # 1.0 asks about every model block (demo)
 fail_closed = true
 require_jwt = true
 

@@ -66,8 +66,9 @@ else
   # Real Kev needs more than 500 ms; an agent should show a block as a reply, with an alert.
   sed -e 's/^model_timeout_ms = [0-9]*/model_timeout_ms = 5000/' \
       -e 's/^on_block = "error"/on_block = "message"/' \
-      -e 's/^desktop = false/desktop = true/' policy.toml > policy.local.toml
-  echo "wrote policy.local.toml (on_block = message, desktop alerts, 5 s timeout)"
+      -e 's/^desktop = false/desktop = true/' \
+      -e 's/^human_approval_band = [0-9.]*/human_approval_band = 1.0 /' policy.toml > policy.local.toml
+  echo "wrote policy.local.toml (on_block = message, desktop alerts, approval for every model block, 5 s timeout)"
 fi
 
 step "Model weights ($KEV_MODEL, pinned + sha256-verified)"

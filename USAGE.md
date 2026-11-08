@@ -35,7 +35,7 @@ About 10 minutes. Uses `demo/notes.md` (clean) and `demo/poisoned-notes.md` (mee
 
 ### Before (once, about 20 minutes)
 
-1. `KEV_MODEL=kev-0.8b scripts/init.sh` (16 GB Mac; `kev-4b` needs 32 GB). Then in `policy.local.toml` confirm `on_block = "message"`, `desktop = true`, `model_timeout_ms = 5000`.
+1. `KEV_MODEL=kev-0.8b scripts/init.sh` (16 GB Mac; `kev-4b` needs 32 GB). Then in `policy.local.toml` confirm `on_block = "message"`, `desktop = true`, `model_timeout_ms = 5000`, `human_approval_timeout_ms = 15000`, `human_approval_band = 1.0` (every model block asks you).
 2. Notifications: `osascript -e 'display notification "test" with title "Zero-Trust Sidecar"'` must show a banner. If not: System Settings > Notifications > Script Editor > Allow.
 3. Claude Code signed in: run `claude`, check `/status`, exit.
 4. Calibrate the threshold. Kev-0.8B scores injections lower than Kev-4B, so 0.70 may let the poisoned file through:
@@ -52,6 +52,7 @@ About 10 minutes. Uses `demo/notes.md` (clean) and `demo/poisoned-notes.md` (mee
 | 2 | `set -a && . ./.env && set +a && ZT_DEBUG=1 cargo run --release` | the sidecar's step log (`A1`..`A6`) |
 | 3 | `scripts/claude.sh` | Claude Code; all its model traffic goes through terminal 2 |
 | 4 | `set -a && . ./.env && set +a && .venv/bin/python backend/app.py` | only for step 6 |
+| 5 | `set -a && . ./.env && set +a && python3 scripts/alert_notifier.py` | the pop-ups; start it before Claude Code |
 
 ### Script
 
@@ -60,14 +61,15 @@ About 10 minutes. Uses `demo/notes.md` (clean) and `demo/poisoned-notes.md` (mee
    - `A1 message roles and blocks (no content) shape=user[...] system[...]`: what Claude Code sent;
    - `A2 scoring only the new turn ... tool_results=1 tools=["Read"]`: only the file it just read is scored, not the system prompt or earlier turns;
    - `A3 model verdict injection=0.0x`, then `A4 allow` and `A5 forwarding ... api_key="client credentials passed through"`.
-2. **The poisoned file is stopped before the model sees it.** Type `Summarize demo/poisoned-notes.md.`
-   Claude Code answers with:
+2. **The poisoned file is stopped before the model sees it, and you decide.** Type `Summarize demo/poisoned-notes.md.`
+   A dialog "Zero Trust Sidecar approval" pops up with the file (`Read {"file_path": ".../demo/poisoned-notes.md"}`), the reason and Kev's score; Claude Code waits (up to 15 s). Click **Block**. Claude Code answers with:
    `[Zero-Trust Sidecar] Blocked: the Read result looks like a prompt injection (Kev injection 0.xx, threshold 0.yy). It was not sent to the model. Use /rewind to drop it or /clear to start over.`
-   A notification "Zero-Trust Sidecar blocked a request" appears. Terminal 2: `A4 deny rule=ModelRiskHigh ... on_block=Message`, then an audit line with `"decision":"deny"`.
+   Terminal 2: `A4 borderline score: asking the human`, `A4 deny rule=ModelRiskHigh ... on_block=Message`, then an audit line with `"decision":"deny"`. (Without terminal 5 there is no dialog: it blocks at once and the sidecar shows a notification itself.)
 3. **It stays blocked.** Type `continue anyway`.
    Reply: `[Zero-Trust Sidecar] This conversation still contains content that was blocked earlier, so nothing was sent to the model. ...` The poisoned file is still in the history Claude Code resends, so every later request is held back. Type `/clear`.
-4. **`@` mentions are covered too.** Type `Summarize @demo/poisoned-notes.md`. Claude Code inlines the file into a `<system-reminder>`; the sidecar scores it as tool output, so it is blocked the same way. `/clear`.
-5. **Policy changes live.** In `policy.local.toml` set `mode = "monitor"` and save. Repeat step 2: the request now goes to the model; terminal 2 shows `A4 monitor mode: would block, forwarding` and the notification says "Would block". Set `mode = "enforce"` again.
+4. **`@` mentions are covered too.** Type `Summarize @demo/poisoned-notes.md`. Claude Code inlines the file into a `<system-reminder>`; the sidecar scores it as tool output, so the same dialog appears. Click **Block**, then `/clear`.
+   **Human override:** repeat step 2 and click **Allow once**. This one request goes to the model (Claude usually refuses the planted instruction by itself); terminal 2 shows `A4 human allowed this request once -> forwarding` and the audit reason `human allowed a borderline score once`. `/clear`.
+5. **Policy changes live.** In `policy.local.toml` set `mode = "monitor"` and save. Repeat step 2: no dialog, the request goes to the model; terminal 2 shows `A4 monitor mode: would block, forwarding` and a notification says "would block". Set `mode = "enforce"` again.
 6. **Route B: tool calls are checked before they run** (start terminal 4; in another shell run `set -a && . ./.env && set +a` first):
    ```bash
    ADMIN=$(python3 scripts/mint_jwt.py demo-admin admin); AGENT=$(python3 scripts/mint_jwt.py)
@@ -88,6 +90,7 @@ About 10 minutes. Uses `demo/notes.md` (clean) and `demo/poisoned-notes.md` (mee
 | The poisoned file is not blocked | Lower `max_injection_confidence` below its `A3` value (applies live). |
 | Every request is blocked | Threshold too low, or a blocked file is still in the conversation: `/clear`. Restarting the sidecar forgets remembered blocks. |
 | No notification | Allow Script Editor notifications (Before, step 2). |
+| No approval dialog | Terminal 5 must be running before the request; check `human_approval_timeout_ms` > 0 and `human_approval_band = 1.0`. Answer within 15 s, or it blocks. |
 | `scripts/claude.sh`: "sidecar not answering" | Start terminal 2; the sidecar must listen on the `sidecar_url` in `[agent_cli_mappings.claude]` (`127.0.0.1:8080`). |
 | Kev cannot run on this machine | `KEV_ENGINE=synthetic` in `.env` shows the same flow with a keyword toy model (it flags "ignore all ..."). Its scores are not Kev's; say so. |
 
@@ -128,6 +131,14 @@ set -a && . ./.env && set +a && ZT_DEBUG=1 cargo run --release
 # DEBUG A3 model verdict injection=<0..1> engine=<KEV_MODEL> model_ms=<ms>
 # DEBUG A4 allow: injection score below threshold max_injection=0.7
 ```
+
+## Pop-ups: alerts and approval
+
+```bash
+set -a && . ./.env && set +a && python3 scripts/alert_notifier.py
+```
+
+The notifier reads the loopback-only `GET /v1/alerts` stream (bearer token `JWT_SECRET`) and shows a notification for each block. A model score at or above its threshold by at most `human_approval_band` (Route A and Route B) waits up to `human_approval_timeout_ms` for **Allow once** or **Block** in a dialog. No notifier running, no answer or a timeout all block; approval never overrides a deterministic rule. While the notifier runs, the sidecar's own `[alerts] desktop` banner is skipped, so each event pops up once. Linux needs `notify-send` and `zenity`.
 
 ## Ask Kev directly
 

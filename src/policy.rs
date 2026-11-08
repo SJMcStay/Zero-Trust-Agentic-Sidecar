@@ -229,6 +229,18 @@ impl std::str::FromStr for PolicyEngine {
                 "max_malicious_intent must be between 0.0 and 1.0, got {max_intent}"
             )));
         }
+        let band = config.defaults.human_approval_band;
+        if !(0.0..=1.0).contains(&band) || band.is_nan() {
+            return Err(PolicyError::ValidationError(format!(
+                "human_approval_band must be between 0.0 and 1.0, got {band}"
+            )));
+        }
+        if config.defaults.human_approval_timeout_ms > 60_000 {
+            return Err(PolicyError::ValidationError(format!(
+                "human_approval_timeout_ms must be 0 or at most 60000, got {}",
+                config.defaults.human_approval_timeout_ms
+            )));
+        }
 
         // 2. Validate global model timeout [1, 60_000] ms
         let timeout = config.defaults.model_timeout_ms;

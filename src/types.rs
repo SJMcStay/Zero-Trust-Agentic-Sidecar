@@ -372,6 +372,14 @@ fn default_model_timeout() -> u64 {
     500
 }
 
+fn default_human_approval_timeout() -> u64 {
+    0
+}
+
+fn default_human_approval_band() -> f32 {
+    0.10
+}
+
 fn default_true() -> bool {
     true
 }
@@ -502,6 +510,14 @@ pub struct DefaultPolicy {
     pub max_malicious_intent: f32,
     #[serde(default = "default_model_timeout")]
     pub model_timeout_ms: u64,
+    /// Wait this long for a human decision on a borderline model score (Route A and B);
+    /// zero disables the hold. Only while a notifier is listening on `GET /v1/alerts`.
+    #[serde(default = "default_human_approval_timeout")]
+    pub human_approval_timeout_ms: u64,
+    /// Borderline = at or above the threshold by at most this much. 1.0 asks about every
+    /// model block.
+    #[serde(default = "default_human_approval_band")]
+    pub human_approval_band: f32,
     #[serde(default = "default_true")]
     pub fail_closed: bool,
     #[serde(default = "default_true")]
@@ -514,6 +530,8 @@ impl Default for DefaultPolicy {
             max_injection_confidence: default_max_injection(),
             max_malicious_intent: default_max_intent(),
             model_timeout_ms: default_model_timeout(),
+            human_approval_timeout_ms: default_human_approval_timeout(),
+            human_approval_band: default_human_approval_band(),
             fail_closed: true,
             require_jwt: true,
         }
