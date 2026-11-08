@@ -214,12 +214,23 @@ async fn spawn_live_sidecar(
     flask_backend_url: String,
     engine: Arc<dyn DecisionEngine>,
 ) -> (String, Config, Arc<Mutex<Vec<AuditEntry>>>) {
+    let policy_engine = PolicyEngine::from_file("policy.toml").expect("load policy.toml");
+    spawn_live_sidecar_with_policy(upstream_llm_url, flask_backend_url, engine, policy_engine).await
+}
+
+/// Same as [`spawn_live_sidecar`] with an explicit policy (e.g. a longer model timeout for
+/// real or debug-build model engines).
+async fn spawn_live_sidecar_with_policy(
+    upstream_llm_url: String,
+    flask_backend_url: String,
+    engine: Arc<dyn DecisionEngine>,
+    policy_engine: PolicyEngine,
+) -> (String, Config, Arc<Mutex<Vec<AuditEntry>>>) {
     let mut config = Config::for_test(E2E_SIDECAR_SECRET, E2E_JWT_SECRET);
     config.anthropic_api_key = Some(E2E_ANTHROPIC_KEY.to_string());
     config.upstream_llm_url = upstream_llm_url;
     config.flask_backend_url = flask_backend_url;
 
-    let policy_engine = PolicyEngine::from_file("policy.toml").expect("load policy.toml");
     let (audit_logger, captured_logs) = AuditLogger::capture();
 
     let state = AppState::test_state(config.clone(), policy_engine, engine, audit_logger);
@@ -934,13 +945,10 @@ async fn test_e2e_native_kev_candle_engine_qwen35_loaded_and_callable_by_route_a
     let head_st_path = temp_dir.join("head.safetensors");
     candle_core::safetensors::save(&head_tensors, &head_st_path).unwrap();
 
-    // 7. Load `KevCandleEngine` via `download_kev_artifacts` + `KevCandleEngine::load`
-    let resolved_paths: KevPaths = zero_trust_agentic_sidecar::ml::kev::download_kev_artifacts(
-        &temp_dir,
-        "jaredpalmer/kev-0.8b",
-        "Qwen/Qwen3.5-0.8B-Base",
-    )
-    .expect("resolve Kev 0.8B artifacts from cache_dir");
+    // 7. Load `KevCandleEngine` via `resolve_kev_artifacts` (flat layout) + `KevCandleEngine::load`
+    let resolved_paths: KevPaths =
+        zero_trust_agentic_sidecar::ml::kev::resolve_kev_artifacts(&temp_dir, &temp_dir)
+            .expect("resolve Kev 0.8B artifacts from temp_dir");
 
     let candle_engine = Arc::new(
         KevCandleEngine::load(&resolved_paths, Device::Cpu, 2, Duration::from_secs(5))
@@ -977,7 +985,20 @@ async fn test_e2e_native_kev_candle_engine_qwen35_loaded_and_callable_by_route_a
     let flask = LiveFlaskBackend::spawn(E2E_SIDECAR_SECRET).await;
     let (upstream_url, upstream_hits) = spawn_mock_anthropic_upstream(E2E_ANTHROPIC_KEY).await;
     let (sidecar_url, config, _) =
-        spawn_live_sidecar(upstream_url, flask.base_url.clone(), candle_engine).await;
+        // This test checks wiring, not latency: a debug-build Candle pass can exceed the
+        // 500 ms production budget in policy.toml, so give it 30 s.
+        spawn_live_sidecar_with_policy(
+            upstream_url,
+            flask.base_url.clone(),
+            candle_engine,
+            PolicyEngine::from_str(
+                &std::fs::read_to_string("policy.toml")
+                    .unwrap()
+                    .replace("model_timeout_ms = 500", "model_timeout_ms = 30000"),
+            )
+            .expect("parse policy.toml"),
+        )
+        .await;
 
     let client = reqwest::Client::new();
 
@@ -1030,29 +1051,27 @@ async fn test_e2e_native_kev_candle_engine_qwen35_loaded_and_callable_by_route_a
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
-/// 10. Live Hugging Face Model Download (`jaredpalmer/kev-0.8b` + `Qwen/Qwen3.5-0.8B-Base`)
-/// and End-to-End Inference Test across Route A and Route B.
+/// 10. Real Kev-0.8B weights (local, verified) through the Candle engine across Route A and B.
+/// Needs ~1.8 GB of weights: `python3 scripts/fetch_model.py kev-0.8b`, then
+/// `cargo test --release --test e2e -- --ignored`. The Candle backbone is experimental, so this
+/// checks plumbing and ordering only, not Kev-equivalent probabilities.
 #[tokio::test]
-async fn test_e2e_real_huggingface_kev_0_8b_and_qwen35_0_8b_download_and_inference() {
-    let cache_dir = std::path::Path::new("models");
-    println!(
-        "Downloading/resolving jaredpalmer/kev-0.8b and Qwen/Qwen3.5-0.8B-Base into {:?}...",
-        cache_dir
-    );
-
-    let paths = zero_trust_agentic_sidecar::ml::kev::download_kev_artifacts(
-        cache_dir,
-        "jaredpalmer/kev-0.8b",
-        "Qwen/Qwen3.5-0.8B-Base",
+#[ignore = "needs local Kev-0.8B weights (scripts/fetch_model.py kev-0.8b)"]
+async fn test_e2e_real_kev_0_8b_local_weights_inference() {
+    let (kev_dir, base_dir) = zero_trust_agentic_sidecar::ml::kev::kev_dirs_from_manifest(
+        std::path::Path::new("models.json"),
+        "kev-0.8b",
     )
-    .expect("Download jaredpalmer/kev-0.8b and Qwen/Qwen3.5-0.8B-Base from Hugging Face Hub");
+    .expect("kev-0.8b entry in models.json");
+    let paths = zero_trust_agentic_sidecar::ml::kev::resolve_kev_artifacts(&kev_dir, &base_dir)
+        .expect("Kev-0.8B weights on disk: run python3 scripts/fetch_model.py kev-0.8b");
 
     println!("Resolved Kev 0.8B paths: {paths:#?}");
     assert!(paths.tokenizer_json.exists());
     assert!(paths.adapter_config_json.exists());
     assert!(paths.adapter_safetensors.exists());
     assert!(paths.base_config_json.exists());
-    assert!(paths.base_safetensors.exists());
+    assert!(paths.base_safetensors.iter().all(|p| p.exists()));
     assert!(paths.head_weights.exists());
 
     let device = zero_trust_agentic_sidecar::ml::kev::select_device();

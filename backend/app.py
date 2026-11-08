@@ -13,12 +13,21 @@ import hashlib
 import hmac
 import math
 import os
+import sys
 import time
 from typing import Any
 
 from flask import Flask, jsonify, request
 
 DEFAULT_FALLBACK_SECRET = "test_sidecar_secret_32_bytes_long_ok"
+
+# ZT_DEBUG=1 prints each signature-check step to stderr (same switch as the sidecar).
+DEBUG = os.environ.get("ZT_DEBUG", "0") not in ("", "0")
+
+
+def _debug(msg: str) -> None:
+    if DEBUG:
+        print(f"[backend debug] {msg}", file=sys.stderr, flush=True)
 
 
 def create_app(
@@ -36,6 +45,8 @@ def create_app(
         raw_secret = secret if isinstance(secret, bytes) else secret.encode("utf-8")
     else:
         env_secret = os.environ.get("SIDECAR_SECRET", DEFAULT_FALLBACK_SECRET)
+        if "SIDECAR_SECRET" not in os.environ:
+            _debug("SIDECAR_SECRET not set: using the built-in test secret (anyone can sign)")
         raw_secret = env_secret.encode("utf-8")
 
     app.config["SIDECAR_SECRET"] = raw_secret
@@ -64,8 +75,10 @@ def create_app(
         ts_header = request.headers.get("X-Sidecar-Timestamp")
         sig_header = request.headers.get("X-Sidecar-Signature")
 
+        _debug(f"{request.method} {request.path}: timestamp={'yes' if ts_header else 'no'} signature={'yes' if sig_header else 'no'}")
         # Missing or empty authentication headers
         if not ts_header or not sig_header or not ts_header.strip() or not sig_header.strip():
+            _debug("reject 401: missing sidecar headers (not sent through the sidecar)")
             return (
                 jsonify({
                     "error": "unauthorized",
@@ -91,6 +104,7 @@ def create_app(
 
         # Replay window / clock skew verification (integer seconds, matching Rust crypto)
         now = int(time.time())
+        _debug(f"timestamp skew {abs(now - ts_int)}s (max {app.config['MAX_SKEW_SECONDS']:.0f}s)")
         if abs(now - ts_int) > app.config["MAX_SKEW_SECONDS"]:
             return (
                 jsonify({
@@ -111,6 +125,7 @@ def create_app(
 
         # Constant-time comparison resistant to timing attacks
         if not hmac.compare_digest(sig_header.strip().lower(), expected_sig.lower()):
+            _debug("reject 401: HMAC signature does not match the body")
             return (
                 jsonify({
                     "error": "unauthorized",
@@ -119,6 +134,7 @@ def create_app(
                 401,
             )
 
+        _debug(f"signature ok ({len(raw_body)} body bytes) -> run handler")
         return None
 
     # 3. Route Handlers & URL Aliases

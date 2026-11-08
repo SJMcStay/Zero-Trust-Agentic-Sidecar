@@ -125,6 +125,23 @@ pub async fn execute_handler(
         }
     };
 
+    tracing::debug!(
+        bytes = body_bytes.len(),
+        session = %req.session_id,
+        endpoint = %req.endpoint,
+        method = %req.method,
+        payload_keys = ?req.payload.keys().collect::<Vec<_>>(),
+        untrusted_inputs = req.context.untrusted_inputs.len(),
+        "B1 tool call received"
+    );
+    tracing::trace!(
+        payload = %crate::debug::preview(
+            &serde_json::to_string(&req.payload).unwrap_or_default(),
+            crate::debug::PREVIEW_CHARS
+        ),
+        "B1 payload preview"
+    );
+
     // =========================================================================
     // Priority 2: Missing / Invalid Auth Check (HTTP 401 Unauthorized)
     // =========================================================================
@@ -148,14 +165,17 @@ pub async fn execute_handler(
             Some(&body_bytes),
         ) {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
+                tracing::debug!(error = %e, "B2 JWT rejected -> 401");
                 return emit_unauthorized(&state, &req, start_time);
             }
         },
         None => {
+            tracing::debug!("B2 no Bearer token -> 401");
             return emit_unauthorized(&state, &req, start_time);
         }
     };
+    tracing::debug!(sub = %claims.sub, role = %claims.role, "B2 JWT ok");
 
     // =========================================================================
     // Step 3: Parallel Evaluation via tokio::join!
@@ -169,6 +189,7 @@ pub async fn execute_handler(
     let timeout_ms = policy_engine.defaults().model_timeout_ms;
     let timeout_dur = Duration::from_millis(timeout_ms);
 
+    let checks_start = Instant::now();
     let (policy_result, ml_result) = tokio::join!(
         async move { evaluate_policy_detailed(&policy_engine, &claims_clone, &req_policy) },
         async move {
@@ -176,20 +197,39 @@ pub async fn execute_handler(
         }
     );
 
+    match &policy_result {
+        Ok(()) => tracing::debug!("B3 policy: endpoint, method, role, args, constraints all pass"),
+        Err(deny) => tracing::debug!(rule = deny.rule, reason = %deny.message, "B3 policy: denied"),
+    }
+
     // Extract ML verdict and scores if available
     let (ml_verdict, ml_scores, ml_timed_out_or_failed) = match ml_result {
         Ok(Ok(verdict)) => {
+            tracing::debug!(
+                injection = verdict.injection_confidence,
+                intent = verdict.malicious_intent,
+                engine = %verdict.model_id,
+                checks_ms = checks_start.elapsed().as_millis() as u64,
+                "B4 model verdict (ran alongside the policy)"
+            );
             let scores = KevScores::from(&verdict);
             (Some(verdict), Some(scores), false)
         }
-        Ok(Err(_ml_err)) => (None, None, true),
-        Err(_timeout) => (None, None, true),
+        Ok(Err(ml_err)) => {
+            tracing::debug!(error = %ml_err, "B4 model error");
+            (None, None, true)
+        }
+        Err(_timeout) => {
+            tracing::debug!(timeout_ms, "B4 model timed out");
+            (None, None, true)
+        }
     };
 
     // =========================================================================
     // Priority 3 through 7: Deterministic Policy Failures
     // =========================================================================
     if let Err(policy_deny) = policy_result {
+        tracing::debug!(rule = policy_deny.rule, "B5 deny: policy rule -> 403");
         let latency_ms = start_time.elapsed().as_millis() as u64;
         let err_resp = ExecuteErrorResponse::new(
             policy_deny.error,
@@ -225,6 +265,7 @@ pub async fn execute_handler(
     let defaults = state.policy_engine.defaults();
 
     if ml_timed_out_or_failed && defaults.fail_closed {
+        tracing::debug!("B5 deny: model unavailable and fail_closed -> 403");
         let latency_ms = start_time.elapsed().as_millis() as u64;
         let err_resp = ExecuteErrorResponse::new(
             "ModelUnavailable",
@@ -259,6 +300,13 @@ pub async fn execute_handler(
             defaults.max_injection_confidence,
             defaults.max_malicious_intent,
         ) {
+            tracing::debug!(
+                injection = verdict.injection_confidence,
+                max_injection = defaults.max_injection_confidence,
+                intent = verdict.malicious_intent,
+                max_intent = defaults.max_malicious_intent,
+                "B5 deny: model score at or above threshold -> 403"
+            );
             let latency_ms = start_time.elapsed().as_millis() as u64;
             let err_resp = ExecuteErrorResponse::new(
                 "ModelRiskHigh",
@@ -352,6 +400,13 @@ pub async fn execute_handler(
         other => reqwest::Method::from_bytes(other.as_bytes()).unwrap_or(reqwest::Method::POST),
     };
 
+    tracing::debug!(
+        url = %target_url,
+        method = %method,
+        signed_ts = timestamp,
+        bytes = outbound_payload_bytes.len(),
+        "B5 allow -> B6 HMAC-signed request to the backend"
+    );
     let backend_req = state
         .http_client
         .request(method, &target_url)
@@ -363,6 +418,7 @@ pub async fn execute_handler(
     let backend_resp = match backend_req.send().await {
         Ok(resp) => resp,
         Err(e) => {
+            tracing::debug!(error = %e, "B6 backend unreachable -> 502");
             let latency_ms = start_time.elapsed().as_millis() as u64;
             let err_resp = ExecuteErrorResponse::new(
                 "BackendError",
@@ -395,6 +451,11 @@ pub async fn execute_handler(
 
     let backend_status =
         StatusCode::from_u16(backend_resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    tracing::debug!(
+        status = backend_status.as_u16(),
+        total_ms = start_time.elapsed().as_millis() as u64,
+        "B7 backend answered; relaying to the agent"
+    );
 
     let mut response_headers = HeaderMap::new();
     if let Some(ct) = backend_resp.headers().get(header::CONTENT_TYPE) {

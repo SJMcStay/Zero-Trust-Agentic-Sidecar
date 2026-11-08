@@ -3,15 +3,12 @@
 # =====================================================================
 
 # ---------------------------------------------------------------------
-# Rust / Cargo
+# Rust / Cargo (Cargo.lock IS committed: this is a binary)
 # ---------------------------------------------------------------------
 /target/
 **/target/
 **/*.rs.bk
 *.pdb
-# Cargo.lock is COMMITTED (this is a binary, not a library).
-
-# Profiling / coverage / bench output
 *.profraw
 *.profdata
 flamegraph.svg
@@ -22,9 +19,8 @@ tarpaulin-report.html
 /criterion/
 
 # ---------------------------------------------------------------------
-# Secrets & crypto material (sidecar does signing/verification)
-# NEVER commit real keys. Put test fixtures under tests/fixtures/ and
-# un-ignore explicitly if needed.
+# Secrets & crypto material. NEVER commit real keys.
+# Test fixtures go under tests/fixtures/ (un-ignored below).
 # ---------------------------------------------------------------------
 .env
 .env.*
@@ -44,16 +40,42 @@ secrets/
 !tests/fixtures/**
 
 # ---------------------------------------------------------------------
-# Jev / model artifacts (large binaries — use Git LFS or download script)
+# Model weights: never in git. scripts/fetch_model.py downloads them
+# (pinned + sha256-verified via models.json / models.lock.json, which ARE committed).
 # ---------------------------------------------------------------------
 /models/
-*.onnx
+**/models--*/
+/.cache/
 *.safetensors
-*.gguf
 *.bin
 *.pt
 *.pth
 *.ckpt
+*.onnx
+*.onnx_data
+*.gguf
+*.ggml
+*.h5
+*.msgpack
+*.npz
+*.tflite
+*.ot
+*.mlpackage/
+*.mlmodelc/
+
+# Kev reference server checkout + its Python env + link-only HF cache (scripts/kev_server.sh)
+/.kev-server/
+
+# ---------------------------------------------------------------------
+# Python (backend + e2e venv)
+# ---------------------------------------------------------------------
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local policy with the real-model timeout (scripts/init.sh)
+policy.local.toml
 
 # Runtime logs / audit output (may contain captured prompts + payloads)
 *.log
@@ -62,40 +84,30 @@ secrets/
 *.jsonl
 
 # ---------------------------------------------------------------------
-# Claude Code
-#   SHARED (commit):  CLAUDE.md, .claude/settings.json, .claude/agents/,
-#                     .claude/commands/, .claude/skills/, .mcp.json
-#   PERSONAL (ignore): below
+# AI coding tools
+#   Claude Code: shared config is committed (CLAUDE.md, .mcp.json,
+#   .claude/settings.json, agents/, commands/, skills/); the rest is personal.
+#   Antigravity / Gemini / others: local state, never committed.
 # ---------------------------------------------------------------------
+.claude/*
+!.claude/settings.json
+!.claude/agents/
+!.claude/commands/
+!.claude/skills/
 CLAUDE.local.md
-.claude/settings.local.json
-.claude/worktrees/
-.claude/todos/
-.claude/shell-snapshots/
-.claude/statsig/
-.claude/*.local.*
 *.original.md
-
-# ---------------------------------------------------------------------
-# Google Antigravity / Gemini CLI / Agentic Workflows
-# ---------------------------------------------------------------------
-.agents/
 .agent/
-.claude/
+.agents/
 .gemini/
 .antigravity/
 .antigravity-server/
-
-# ---------------------------------------------------------------------
-# Other AI tooling (in case collaborators use them)
-# ---------------------------------------------------------------------
 .cursor/
 .aider*
 .codex/
 .continue/
 
 # ---------------------------------------------------------------------
-# Editors / IDEs
+# Editors / IDEs / OS / scratch
 # ---------------------------------------------------------------------
 .vscode/*
 !.vscode/extensions.json
@@ -106,25 +118,12 @@ CLAUDE.local.md
 *.swo
 *~
 .history/
-
-# ---------------------------------------------------------------------
-# OS
-# ---------------------------------------------------------------------
 .DS_Store
 .AppleDouble
 .LSOverride
 Thumbs.db
 ehthumbs.db
 Desktop.ini
-
-# ---------------------------------------------------------------------
-# Scratch
-# ---------------------------------------------------------------------
 /tmp/
 /scratch/
 *.tmp
-.agents/
-__pycache__/
-*.pyc
-.pytest_cache/
-.venv/

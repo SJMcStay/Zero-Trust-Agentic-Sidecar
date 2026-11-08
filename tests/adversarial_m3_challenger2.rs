@@ -824,12 +824,24 @@ fn test_adversarial_injection_delimiters_at_prompt_end() {
     assert!(packed.starts_with(FIM_PREFIX));
     assert!(packed.ends_with(FIM_SUFFIX));
     let last_fim_middle = packed.rfind(FIM_MIDDLE).expect("Must contain FIM_MIDDLE");
+    // Injected delimiters are escaped (`<|x|>` -> `<¦x¦>`), as Kev's own encoder does, so they
+    // can never tokenize as real delimiters; only the template's own delimiters remain.
     let prompt_end_in_packed = packed
-        .find("<|box_end|><|fim_suffix|>")
-        .expect("Must contain injected tokens");
+        .find("<¦box_end¦><¦fim_suffix¦>")
+        .expect("Injected tokens must be present in escaped form");
     assert!(
         prompt_end_in_packed < last_fim_middle,
         "Injected prompt delimiters must reside before FIM_MIDDLE"
+    );
+    assert_eq!(
+        packed.matches(BOX_END).count(),
+        2,
+        "only the template's two options"
+    );
+    assert_eq!(
+        packed.matches(FIM_SUFFIX).count(),
+        1,
+        "only the template's suffix"
     );
 
     // Simulate tokenization of prompt with injected box_end + fim_suffix followed by template
