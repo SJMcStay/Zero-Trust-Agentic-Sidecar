@@ -1,10 +1,10 @@
-# Zero-Trust Agentic Sidecar
+# Aegis Sidecar
 **A Deterministic Execution Proxy for AI Agents**
 
 ## Overview
 Autonomous LLM agents are highly susceptible to indirect prompt injection, turning unauthorized tool execution into a critical Sev-1 remote code execution (RCE) vulnerability. Filtering prompts with another LLM is non-deterministic and slow. This project adds a deterministic security layer instead.
 
-The **Zero-Trust Agentic Sidecar** is a Rust proxy between a local LLM agent and both the LLM API and internal backend APIs. It scores prompts and tool calls for prompt injection and malicious intent with [Kev](https://huggingface.co/jaredpalmer/kev-4b), an open, Jev-compatible System One decision model running on this machine. Tool calls are then checked against zero-trust policy rules and cryptographically signed. Malicious payloads are dropped before they reach the backend.
+The **Aegis Sidecar** is a Rust proxy between a local LLM agent and both the LLM API and internal backend APIs. It scores prompts and tool calls for prompt injection and malicious intent with [Kev](https://huggingface.co/jaredpalmer/kev-4b), an open, Jev-compatible System One decision model running on this machine. Tool calls are then checked against zero-trust policy rules and cryptographically signed. Malicious payloads are dropped before they reach the backend.
 
 ## Key Features
 - **Kev interrogation (local)**: calibrated `injection_confidence` and `malicious_intent` probabilities from Kev, run on this machine. Policy and model checks run concurrently (`tokio::join!`); the model is still on the critical path, so latency is Kev's latency.
@@ -20,7 +20,7 @@ The **Zero-Trust Agentic Sidecar** is a Rust proxy between a local LLM agent and
 ```text
                        Route A: POST /v1/messages (Prompt Interception + Kev Eval)
 +---------------------+ -----------------------------------------------------------> +----------------------------------+
-|                     |                                                              |   Zero-Trust Agentic Sidecar     |
+|                     |                                                              |          Aegis Sidecar           |
 |  Client / Agent CLI |                                                              |       (Rust / Axum + Kev)        |
 | (Claude Code / Qwen)|                                                              |          localhost:8080          |
 +---------------------+ -----------------------------------------------------------> +----------------------------------+
