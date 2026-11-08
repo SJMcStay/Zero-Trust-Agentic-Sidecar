@@ -155,17 +155,41 @@ pub type ExecutionContext = ToolContext;
 pub struct ToolExecuteRequest {
     /// Unique session or trace identifier.
     pub session_id: String,
-    /// Target path (e.g. `/api/v1/system/status`).
+    /// Target path (e.g. `/api/v1/system/status`) or local tool name (e.g. `bash`).
+    #[serde(alias = "tool", alias = "tool_name", alias = "name")]
     pub endpoint: String,
     /// Target HTTP method, defaults to `"POST"`.
     #[serde(default = "default_post_method")]
     pub method: String,
-    /// Dynamic JSON payload forwarded to target microservice.
-    #[serde(default)]
+    /// Dynamic JSON payload forwarded to target microservice or tool parameters.
+    #[serde(default, alias = "args", alias = "arguments", alias = "parameters")]
     pub payload: serde_json::Map<String, serde_json::Value>,
     /// Security context including user prompts and untrusted input logs.
     #[serde(default)]
     pub context: ToolContext,
+}
+
+impl ToolExecuteRequest {
+    /// Resolves target tool name if this request targets a tool, or None if it targets an endpoint.
+    pub fn resolved_tool_name<'a>(
+        &'a self,
+        engine: &'a crate::policy::PolicyEngine,
+    ) -> Option<&'a str> {
+        if engine.get_tool(&self.endpoint).is_some() {
+            return Some(&self.endpoint);
+        }
+        if let Some(stripped) = self.endpoint.strip_prefix("tool:") {
+            if engine.get_tool(stripped).is_some() {
+                return Some(stripped);
+            }
+        }
+        if let Some(stripped) = self.endpoint.strip_prefix("/tools/") {
+            if engine.get_tool(stripped).is_some() {
+                return Some(stripped);
+            }
+        }
+        None
+    }
 }
 
 /// Success response returned when a tool call is approved and executed.
@@ -282,6 +306,32 @@ pub struct RouteAErrorDetail {
     pub malicious_intent: f32,
 }
 
+/// Individual tool execution result paired with its invocation context from the preceding assistant turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScopedToolResult {
+    /// ID linking this result to the tool_use block in the preceding assistant message.
+    pub tool_use_id: Option<String>,
+    /// Name of the invoked tool (e.g. "WebFetch", "bash").
+    pub tool_name: Option<String>,
+    /// Arguments passed to the tool during invocation.
+    pub tool_input: Option<serde_json::Value>,
+    /// Untrusted text content returned by the tool execution.
+    pub content: String,
+}
+
+/// Extracted inputs for the active conversation turn, isolating newly introduced untrusted content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScopedTurn {
+    /// Flattened text representation prepared for ML prompt injection scoring.
+    pub text_to_score: String,
+    /// Indicates whether the active turn contains non-empty text to score.
+    pub has_content: bool,
+    /// Untrusted text inputs provided directly by the user in this turn.
+    pub user_text: Vec<String>,
+    /// Untrusted tool outputs paired with their invocation context.
+    pub tool_results: Vec<ScopedToolResult>,
+}
+
 // ==============================================================================
 // 4. Zero-Trust Audit Logging Struct
 // ==============================================================================
@@ -352,16 +402,33 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_kev_tokens() -> usize {
+    8192
+}
+
+fn default_protocol() -> String {
+    "anthropic".to_string()
+}
+
 /// Root schema deserialized from `policy.toml`.
+///
+/// Enforces fail-closed deserialization: any unrecognized key or malformed table
+/// will cause immediate deserialization failure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     pub defaults: DefaultPolicy,
     #[serde(default)]
     pub endpoints: HashMap<String, EndpointRule>,
+    #[serde(default)]
+    pub tools: HashMap<String, ToolRule>,
+    #[serde(default)]
+    pub agent_cli_mappings: HashMap<String, AgentCliMapping>,
 }
 
 /// Global operational thresholds and invariants.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DefaultPolicy {
     #[serde(default = "default_max_injection")]
     pub max_injection_confidence: f32,
@@ -373,6 +440,12 @@ pub struct DefaultPolicy {
     pub fail_closed: bool,
     #[serde(default = "default_true")]
     pub require_jwt: bool,
+    #[serde(default = "default_true")]
+    pub scope_current_turn_only: bool,
+    #[serde(default = "default_true")]
+    pub exclude_system_prompt: bool,
+    #[serde(default = "default_max_kev_tokens")]
+    pub max_kev_tokens: usize,
 }
 
 impl Default for DefaultPolicy {
@@ -383,12 +456,36 @@ impl Default for DefaultPolicy {
             model_timeout_ms: default_model_timeout(),
             fail_closed: true,
             require_jwt: true,
+            scope_current_turn_only: default_true(),
+            exclude_system_prompt: default_true(),
+            max_kev_tokens: default_max_kev_tokens(),
         }
+    }
+}
+
+impl DefaultPolicy {
+    /// Configures the exclude_system_prompt setting.
+    pub fn with_exclude_system_prompt(mut self, exclude: bool) -> Self {
+        self.exclude_system_prompt = exclude;
+        self
+    }
+
+    /// Configures the scope_current_turn_only setting.
+    pub fn with_scope_current_turn_only(mut self, scope: bool) -> Self {
+        self.scope_current_turn_only = scope;
+        self
+    }
+
+    /// Configures the max_kev_tokens setting.
+    pub fn with_max_kev_tokens(mut self, max_tokens: usize) -> Self {
+        self.max_kev_tokens = max_tokens;
+        self
     }
 }
 
 /// Specific access control and constraint rules per endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointRule {
     pub backend_url: String,
     #[serde(default = "default_true")]
@@ -401,10 +498,116 @@ pub struct EndpointRule {
     pub required_args: Vec<String>,
     #[serde(default)]
     pub constraints: HashMap<String, ArgConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_injection_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_malicious_intent: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_timeout_ms: Option<u64>,
+}
+
+impl EndpointRule {
+    /// Resolves effective operational thresholds, falling back to global defaults.
+    pub fn effective_thresholds(&self, defaults: &DefaultPolicy) -> (f32, f32) {
+        (
+            self.max_injection_confidence
+                .unwrap_or(defaults.max_injection_confidence),
+            self.max_malicious_intent
+                .unwrap_or(defaults.max_malicious_intent),
+        )
+    }
+
+    /// Resolves effective model timeout in milliseconds, falling back to global default.
+    pub fn effective_timeout_ms(&self, defaults: &DefaultPolicy) -> u64 {
+        self.model_timeout_ms.unwrap_or(defaults.model_timeout_ms)
+    }
+}
+
+/// Specific access control and constraint rules for local CLI tool execution (R1, R4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolRule {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_roles: Vec<String>,
+    #[serde(default)]
+    pub required_args: Vec<String>,
+    #[serde(default)]
+    pub constraints: HashMap<String, ArgConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_injection_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_malicious_intent: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_timeout_ms: Option<u64>,
+}
+
+impl Default for ToolRule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_roles: Vec::new(),
+            required_args: Vec::new(),
+            constraints: HashMap::new(),
+            max_injection_confidence: None,
+            max_malicious_intent: None,
+            model_timeout_ms: None,
+        }
+    }
+}
+
+impl ToolRule {
+    /// Resolves effective operational thresholds, falling back to global defaults.
+    pub fn effective_thresholds(&self, defaults: &DefaultPolicy) -> (f32, f32) {
+        (
+            self.max_injection_confidence
+                .unwrap_or(defaults.max_injection_confidence),
+            self.max_malicious_intent
+                .unwrap_or(defaults.max_malicious_intent),
+        )
+    }
+
+    /// Resolves effective model timeout in milliseconds, falling back to global default.
+    pub fn effective_timeout_ms(&self, defaults: &DefaultPolicy) -> u64 {
+        self.model_timeout_ms.unwrap_or(defaults.model_timeout_ms)
+    }
+}
+
+/// Configuration-driven mapping for target agent CLIs (R2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCliMapping {
+    /// Primary environment variable name to route CLI traffic through sidecar (e.g. "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "OLLAMA_HOST").
+    pub env_var: String,
+    /// Upstream API key environment variable name to redact from logs (e.g. "ANTHROPIC_API_KEY", "OPENAI_API_KEY").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env_var: Option<String>,
+    /// Sidecar URL that the agent CLI should be directed to (e.g. "http://127.0.0.1:8080").
+    pub sidecar_url: String,
+    /// Upstream LLM URL to which the sidecar proxies requests (e.g. "https://api.anthropic.com/v1/messages").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_url: Option<String>,
+    /// Wire protocol ("anthropic", "openai", "ollama", "gemini"). Defaults to "anthropic".
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    /// Additional environment variables required by the target agent CLI.
+    #[serde(default)]
+    pub extra_env: HashMap<String, String>,
+}
+
+impl AgentCliMapping {
+    /// Constructs the environment variable pairs needed to direct the agent CLI to the sidecar.
+    pub fn to_env_vars(&self) -> HashMap<String, String> {
+        let mut envs = self.extra_env.clone();
+        envs.insert(self.env_var.clone(), self.sidecar_url.clone());
+        envs
+    }
 }
 
 /// Constraint validation rules for an individual payload argument.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArgConstraint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regex: Option<String>,
@@ -726,5 +929,165 @@ mod tests {
         let drop_rule = policy.endpoints.get("/api/v1/db/drop").unwrap();
         assert!(!drop_rule.enabled);
         assert!(drop_rule.allowed_roles.is_empty());
+    }
+
+    #[test]
+    fn test_policy_config_full_deserialization_with_tools_and_mappings() {
+        let toml_data = r#"
+        [defaults]
+        max_injection_confidence = 0.65
+        max_malicious_intent = 0.45
+        model_timeout_ms = 400
+        fail_closed = true
+        require_jwt = true
+        scope_current_turn_only = true
+        exclude_system_prompt = true
+        max_kev_tokens = 4096
+
+        [endpoints."/api/v1/system/status"]
+        backend_url = "http://127.0.0.1:5000/api/v1/system/status"
+        enabled = true
+        allowed_methods = ["GET", "POST"]
+        allowed_roles = ["agent"]
+        required_args = ["service"]
+        constraints.service = { regex = "^[a-z0-9-]+$", max_len = 64 }
+        max_malicious_intent = 0.30
+        model_timeout_ms = 600
+
+        [tools."bash"]
+        enabled = true
+        allowed_roles = ["admin"]
+        required_args = ["command"]
+        constraints.command = { regex = "^[a-zA-Z0-9_./ -]+$", max_len = 512 }
+        max_malicious_intent = 0.40
+
+        [agent_cli_mappings.claude]
+        env_var = "ANTHROPIC_BASE_URL"
+        api_key_env_var = "ANTHROPIC_API_KEY"
+        sidecar_url = "http://127.0.0.1:8080"
+        upstream_url = "https://api.anthropic.com/v1/messages"
+        protocol = "anthropic"
+        extra_env = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+        "#;
+
+        let policy: PolicyConfig = toml::from_str(toml_data).unwrap();
+        assert_eq!(policy.defaults.max_injection_confidence, 0.65);
+        assert_eq!(policy.defaults.max_malicious_intent, 0.45);
+        assert_eq!(policy.defaults.model_timeout_ms, 400);
+        assert!(policy.defaults.scope_current_turn_only);
+        assert!(policy.defaults.exclude_system_prompt);
+        assert_eq!(policy.defaults.max_kev_tokens, 4096);
+
+        // Verify Endpoint threshold override
+        let ep = policy.endpoints.get("/api/v1/system/status").unwrap();
+        assert_eq!(ep.max_malicious_intent, Some(0.30));
+        assert_eq!(ep.max_injection_confidence, None);
+        let (inj, intent) = ep.effective_thresholds(&policy.defaults);
+        assert_eq!(inj, 0.65); // inherited from default
+        assert_eq!(intent, 0.30); // overridden
+        assert_eq!(ep.effective_timeout_ms(&policy.defaults), 600); // overridden
+
+        // Verify Tool rule
+        let tool = policy.tools.get("bash").unwrap();
+        assert!(tool.enabled);
+        assert_eq!(tool.allowed_roles, vec!["admin"]);
+        assert_eq!(tool.required_args, vec!["command"]);
+        let (t_inj, t_intent) = tool.effective_thresholds(&policy.defaults);
+        assert_eq!(t_inj, 0.65);
+        assert_eq!(t_intent, 0.40);
+        assert_eq!(tool.effective_timeout_ms(&policy.defaults), 400);
+
+        // Verify Agent CLI Mapping
+        let cli = policy.agent_cli_mappings.get("claude").unwrap();
+        assert_eq!(cli.env_var, "ANTHROPIC_BASE_URL");
+        assert_eq!(cli.api_key_env_var.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(cli.protocol, "anthropic");
+        let env_map = cli.to_env_vars();
+        assert_eq!(
+            env_map.get("ANTHROPIC_BASE_URL"),
+            Some(&"http://127.0.0.1:8080".to_string())
+        );
+        assert_eq!(
+            env_map.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deny_unknown_fields_on_all_policy_structs() {
+        // Unknown field at root
+        let bad_root = r#"
+        [defaults]
+        [unknown_section]
+        foo = "bar"
+        "#;
+        assert!(toml::from_str::<PolicyConfig>(bad_root).is_err());
+
+        // Unknown field in defaults
+        let bad_defaults = r#"
+        [defaults]
+        unknown_key = 123
+        "#;
+        assert!(toml::from_str::<PolicyConfig>(bad_defaults).is_err());
+
+        // Unknown field in endpoint
+        let bad_endpoint = r#"
+        [defaults]
+        [endpoints."/api/v1/status"]
+        backend_url = "http://localhost:5000"
+        invalid_endpoint_key = true
+        "#;
+        assert!(toml::from_str::<PolicyConfig>(bad_endpoint).is_err());
+
+        // Unknown field in tools
+        let bad_tool = r#"
+        [defaults]
+        [tools."bash"]
+        backend_url = "http://localhost:5000"
+        "#;
+        assert!(toml::from_str::<PolicyConfig>(bad_tool).is_err());
+
+        // Unknown field in agent_cli_mappings
+        let bad_cli = r#"
+        [defaults]
+        [agent_cli_mappings.claude]
+        env_var = "ANTHROPIC_BASE_URL"
+        sidecar_url = "http://localhost:8080"
+        unknown_flag = false
+        "#;
+        assert!(toml::from_str::<PolicyConfig>(bad_cli).is_err());
+
+        // Unknown field in constraint (e.g. misspelling max_len as maxlen)
+        let bad_constraint = r#"
+        [defaults]
+        [endpoints."/api/v1/status"]
+        backend_url = "http://localhost:5000"
+        constraints.service = { maxlen = 64 }
+        "#;
+        assert!(toml::from_str::<PolicyConfig>(bad_constraint).is_err());
+    }
+
+    #[test]
+    fn test_tool_rule_defaults_and_effective_thresholds() {
+        let defaults = DefaultPolicy::default();
+        assert_eq!(defaults.max_injection_confidence, 0.70);
+        assert_eq!(defaults.max_malicious_intent, 0.50);
+        assert_eq!(defaults.model_timeout_ms, 500);
+        assert!(defaults.scope_current_turn_only);
+        assert!(defaults.exclude_system_prompt);
+        assert_eq!(defaults.max_kev_tokens, 8192);
+
+        let mut tool = ToolRule::default();
+        assert!(tool.enabled);
+        assert!(tool.allowed_roles.is_empty());
+        assert!(tool.required_args.is_empty());
+        assert!(tool.constraints.is_empty());
+        assert_eq!(tool.effective_thresholds(&defaults), (0.70, 0.50));
+        assert_eq!(tool.effective_timeout_ms(&defaults), 500);
+
+        tool.max_malicious_intent = Some(0.25);
+        tool.model_timeout_ms = Some(1200);
+        assert_eq!(tool.effective_thresholds(&defaults), (0.70, 0.25));
+        assert_eq!(tool.effective_timeout_ms(&defaults), 1200);
     }
 }

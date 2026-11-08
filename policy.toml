@@ -1,10 +1,27 @@
+# ==============================================================================
+# Zero-Trust Security Policy Configuration (`policy.toml`)
+# ==============================================================================
+# Fail-Closed Invariant:
+# All sections and fields are validated strictly against Rust schemas with
+# #[serde(deny_unknown_fields)]. Any unrecognized field or out-of-bounds
+# threshold triggers an immediate startup termination.
+
+# ------------------------------------------------------------------------------
+# 1. Global Defaults and Invariants
+# ------------------------------------------------------------------------------
 [defaults]
 max_injection_confidence = 0.70
 max_malicious_intent = 0.50
 model_timeout_ms = 500
 fail_closed = true
 require_jwt = true
+scope_current_turn_only = true
+exclude_system_prompt = true
+max_kev_tokens = 8192
 
+# ------------------------------------------------------------------------------
+# 2. Protected Microservice Endpoints (Route B Execution Proxy)
+# ------------------------------------------------------------------------------
 [endpoints."/api/v1/system/status"]
 backend_url = "http://127.0.0.1:5000/api/v1/system/status"
 enabled = true
@@ -21,6 +38,9 @@ allowed_roles = ["agent", "admin"]
 required_args = ["to", "body"]
 constraints.to = { regex = "^[^@]+@ourcompany\\.com$", max_len = 128 }
 constraints.body = { max_len = 2000 }
+# User-adjustable per-endpoint risk threshold overrides (R1)
+max_injection_confidence = 0.65
+max_malicious_intent = 0.35
 
 [endpoints."/api/v1/db/drop"]
 backend_url = "http://127.0.0.1:5000/api/v1/db/drop"
@@ -28,3 +48,55 @@ enabled = false
 allowed_methods = ["POST"]
 allowed_roles = []
 required_args = ["table"]
+
+# ------------------------------------------------------------------------------
+# 3. Local CLI Tool Execution Policies (R1 + R4)
+# ------------------------------------------------------------------------------
+# Intercepts actual executed tools locally on the agent CLI host.
+[tools."bash"]
+enabled = true
+allowed_roles = ["admin"]
+required_args = ["command"]
+constraints.command = { regex = "^[a-zA-Z0-9_./ -]+$", max_len = 512 }
+max_malicious_intent = 0.40
+
+[tools."file_edit"]
+enabled = true
+allowed_roles = ["agent", "admin"]
+required_args = ["path", "content"]
+constraints.path = { regex = "^[a-zA-Z0-9_./-]+$", max_len = 256 }
+constraints.content = { max_len = 32768 }
+max_malicious_intent = 0.40
+
+[tools."web_fetch"]
+enabled = true
+allowed_roles = ["agent", "admin"]
+required_args = ["url"]
+constraints.url = { regex = "^https://[a-zA-Z0-9.-]+(/.*)?$", max_len = 1024 }
+max_injection_confidence = 0.60
+
+# ------------------------------------------------------------------------------
+# 4. CLI-Agnostic Environment Variable Mappings (R2)
+# ------------------------------------------------------------------------------
+# Configuration-driven mapping allowing different agent CLIs to route traffic
+# through the zero-trust sidecar proxy.
+[agent_cli_mappings.claude]
+env_var = "ANTHROPIC_BASE_URL"
+api_key_env_var = "ANTHROPIC_API_KEY"
+sidecar_url = "http://127.0.0.1:8080"
+upstream_url = "https://api.anthropic.com/v1/messages"
+protocol = "anthropic"
+extra_env = { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1" }
+
+[agent_cli_mappings.codex]
+env_var = "OPENAI_BASE_URL"
+api_key_env_var = "OPENAI_API_KEY"
+sidecar_url = "http://127.0.0.1:8080/v1"
+upstream_url = "https://api.openai.com/v1/chat/completions"
+protocol = "openai"
+
+[agent_cli_mappings.ollama]
+env_var = "OLLAMA_HOST"
+sidecar_url = "http://127.0.0.1:8080"
+upstream_url = "http://127.0.0.1:11434"
+protocol = "ollama"
