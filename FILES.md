@@ -31,6 +31,8 @@
 | `scripts/fetch_model.py` | Downloads a `models.json` model into `models/`, pinned and sha256-verified |
 | `scripts/kev_server.sh` | Kev reference server on `127.0.0.1:8008`, offline, reading `models/` |
 | `scripts/cleanup.sh` | Deletes generated files; lists sizes and asks first |
+| `scripts/trace.sh` | Runs mock LLM + backend + sidecar and prints decisions, latency and audit lines |
+| `scripts/mint_jwt.py` | Mints an agent JWT for calling Route B by hand |
 | **backend/** | |
 | `backend/app.py` | Flask target backend on `:5000`; rejects unsigned requests |
 | `backend/requirements.txt` | Backend and test dependencies (installed into `.venv/` by `init.sh`) |

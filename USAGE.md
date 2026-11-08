@@ -15,12 +15,29 @@ Creates `.env` (fresh secrets; add your `ANTHROPIC_API_KEY`), `policy.local.toml
 
 ```bash
 scripts/kev_server.sh                                                 # 1: Kev on 127.0.0.1:8008
-set -a && . ./.env && set +a && .venv/bin/python backend/app.py      # 2: backend on :5000
+set -a && . ./.env && set +a && .venv/bin/python backend/app.py      # 2: backend on 127.0.0.1:5001
 set -a && . ./.env && set +a && cargo run --release                  # 3: sidecar on :8080
 ANTHROPIC_BASE_URL=http://localhost:8080 claude                       # 4: Claude Code through Route A
 ```
 
-The sidecar exits at startup if Kev is not answering (fail closed).
+The sidecar exits at startup if Kev is not answering (fail closed). The backend uses port 5001 because macOS's AirPlay Receiver holds 5000.
+
+## Trace requests end to end
+
+```bash
+scripts/trace.sh                       # needs the Kev server; mock LLM, so no Anthropic key needed
+KEV_ENGINE=synthetic scripts/trace.sh  # without Kev: plumbing only
+```
+
+Sends benign and malicious requests through Route A and B and prints each decision, its latency, the audit lines, and what reached the LLM API and the backend.
+
+Route B by hand:
+```bash
+set -a && . ./.env && set +a
+curl -s localhost:8080/api/execute -H "Authorization: Bearer $(python3 scripts/mint_jwt.py)" \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"s1","endpoint":"/api/v1/system/status","payload":{"service":"payments-api"}}'
+```
 
 ## Ask Kev directly
 
