@@ -229,7 +229,8 @@ required_args = ["table"]
      - `X-Sidecar-Signature`: `hex(HMAC-SHA256(SIDECAR_SECRET, "{ts}.{raw_body}"))`
    - Flask (`backend/app.py`) verifies `(now - ts) <= 30s` and checks `hmac.compare_digest` before executing any route handler.
 
----
+
+Reasons and trade-offs: see `ARCHITECTURE.md`.
 
 ## 6. Repository Layout
 
@@ -264,18 +265,33 @@ Zero-Trust-Agentic-Sidecar/
     └── e2e.rs                  # Rust E2E tests covering Route A, Route B, JWT/HMAC, Policy, and Candle Kev engine
 ```
 
----
+Env: `SIDECAR_SECRET` (required) · `POLICY_PATH` · `MODEL_KIND` (`heuristic`|`onnx`|`http`) · `MODEL_DIR` · `MODEL_URL` · `SIDECAR_ADDR` · `BACKEND_ADDR`
 
-## 7. Implementation Tickets
+## Tickets
 
-| ID | Ticket | Description | Verification Command |
-| :--- | :--- | :--- | :--- |
-| **T1** | Project Scaffolding & Config | Root `Cargo.toml` (with `candle-core`, `candle-nn`, `hf-hub`, `axum`, `tokio`, `reqwest`, `jsonwebtoken`), `policy.toml`, `.env.example`, `src/config.rs`, `src/types.rs` | `cargo check` |
-| **T2** | Cryptographic Auth (`src/crypto.rs`) | HS256 JWT verification/minting for Agent → Sidecar (`Route B`) and constant-time HMAC-SHA256 signing/verification for Sidecar → Flask | `cargo test crypto` |
-| **T3** | Zero-Trust Policy Engine (`src/policy.rs`) | Load & validate `policy.toml`; enforce endpoint allowlist, `enabled` flag, role permissions, required args, `max_len`, and linear-time `regex` constraints | `cargo test policy` |
-| **T4** | Native Candle + Kev `.safetensors` Engine (`src/ml/`) | Download Kev `.safetensors` + `tokenizer.json` via `hf-hub` directly in Rust; merge LoRA weights in `candle-nn` on Metal/CPU; implement Kev delimiter packing + `PointerHead` readout + sliding window chunking | `cargo test ml` |
-| **T5** | Audit Logger (`src/audit.rs`) | Emit JSONL audit events for Route A and Route B to `stdout` without logging secret headers or sensitive payload values | `cargo test audit` |
-| **T6** | Route A: Inbound Message Gateway (`src/routes/messages.rs`) | `POST /v1/messages`: extract prompt text, run Kev ML evaluation, block injections with `403`, or inject `x-api-key` and stream/forward to Anthropic API (`UPSTREAM_LLM_URL`) | `cargo test route_a` |
-| **T7** | Route B: Outbound Tool Execution (`src/routes/execute.rs`) | `POST /api/execute`: parallel JWT verification + `policy.toml` check + Kev ML intent/injection evaluation; sign approved requests with HMAC-SHA256 and forward to Flask `:5000` | `cargo test route_b` |
-| **T8** | Python Flask Target Backend (`backend/app.py`) | Flask server on `localhost:5000` with HMAC signature verification decorator, safe `/api/v1/system/status`, `/api/v1/email/send`, and vulnerable `/api/v1/db/drop` | `pytest backend/test_backend.py` |
-| **T9** | End-to-End Integration Suite (`tests/e2e.rs`) | Full E2E tests verifying Route A prompt filtering + API key injection, Route B policy + Kev blocking `/api/v1/db/drop`, allowed signed tool execution, and `401` on direct backend access | `cargo test --test e2e` |
+| ID | Ticket | Needs | Test |
+| --- | --- | --- | --- |
+| A1 | Workspace + 4 crates + CI (fmt, clippy, test) | — | `cargo build --workspace` |
+| A2 | Shared types, serde round-trip | A1 | `cargo test -p common types` |
+| A3 | `DecisionModel` trait + `FixedModel` fake | A2 | `cargo test -p common model` |
+| C1 | `sign` / `verify` | A1 | `cargo test -p common signing` |
+| C2 | axum verify extractor (401) | C1 | `cargo test -p common signing` |
+| B1 | Server, `/healthz`, env config | A2 | `cargo test -p sidecar server` |
+| B2 | Policy load + validate | A2 | `cargo test -p sidecar policy` |
+| B3 | Policy check (steps 2–4), pure fn | B2 | `cargo test -p sidecar policy` |
+| B4 | Pipeline: parallel + timeout + decision order | A3, B3 | `cargo test -p sidecar pipeline` |
+| B5 | Forwarder (sign + POST) | C1, B4 | `cargo test -p sidecar forward` |
+| B6 | Audit log | B4 | `cargo test -p sidecar audit` |
+| E1 | Mock backend | C2 | `cargo test -p mock-backend` |
+| E2 | End-to-end test, random ports | E1, B5 | `cargo test --test e2e` |
+| D1 | `HeuristicModel` | A3 | `cargo test -p decision-model heuristic` |
+| D2 | Pick model (Kev?): format, license, p50/p99 on laptop | — | add result to `ARCHITECTURE.md` |
+| D3 | Input builder + windowing | A2 | `cargo test -p decision-model input` |
+| D4 | `OnnxModel` | A3, D2 | `cargo test -p decision-model --features onnx` |
+| D5 | Eval fixtures, precision/recall | D1 | `cargo run -p decision-model --example eval` |
+| D6 | Latency bench | B4, D4 | `cargo run --release --example bench` |
+
+## Open
+
+- Kev: format (ONNX / safetensors / GGUF), license, latency → D2.
+- Keep name "Jev" in README or make it generic?
