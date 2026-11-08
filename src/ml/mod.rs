@@ -1,20 +1,20 @@
-//! Native Rust Candle ML Engine & Model Loading (`src/ml/mod.rs`)
+//! Decision engines (`src/ml/mod.rs`)
 //!
-//! Provides the System One execution security classifier for autonomous AI agents.
-//! Evaluates raw prompt text (Route A: `POST /v1/messages`) and structured tool
-//! execution requests (Route B: `POST /api/execute`) via in-process Candle tensor
-//! inference with zero Python runtime dependency.
+//! Scores raw prompt text (Route A: `POST /v1/messages`) and structured tool execution
+//! requests (Route B: `POST /api/execute`) for prompt injection and malicious intent.
 //!
-//! Features:
-//! - [`DecisionEngine`] trait: async trait interface for model evaluation.
-//! - Sliding-window chunking: splits arbitrary-length inputs into overlapping windows
-//!   and aggregates verdicts via maximum confidence pooling.
-//! - UTF-8 safe text windowing and token sequence chunking.
-//! - Production Kev model loading and LoRA folding via [`kev`].
+//! Engines (selected with `KEV_ENGINE`, see `main.rs`):
+//! - [`KevHttpEngine`] (`http`, default): asks Kev's reference server on loopback; real Kev answers.
+//! - [`KevCandleEngine`] (`candle`): in-process Candle port; experimental, not yet Kev-equivalent.
+//! - [`SyntheticKevEngine`] (`synthetic`): deterministic toy graph for tests and demos only.
+//!
+//! Also: the [`DecisionEngine`] trait, sliding-window chunking with max-confidence pooling.
 
 pub mod kev;
+pub mod kev_http;
 
 pub use kev::*;
+pub use kev_http::*;
 
 use crate::types::{KevVerdict, ToolExecuteRequest};
 use async_trait::async_trait;

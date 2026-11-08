@@ -22,6 +22,30 @@ pub enum ConfigError {
     InvalidValue { var: &'static str, reason: String },
 }
 
+/// Which decision engine scores prompts and tool calls (`KEV_ENGINE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KevEngineKind {
+    /// Kev's reference server on loopback (`scripts/kev_server.sh`). Default.
+    Http,
+    /// In-process Candle port. Experimental: not yet numerically equivalent to Kev.
+    Candle,
+    /// Deterministic toy graph. Tests and demos only.
+    Synthetic,
+}
+
+impl std::str::FromStr for KevEngineKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http" => Ok(Self::Http),
+            "candle" => Ok(Self::Candle),
+            "synthetic" => Ok(Self::Synthetic),
+            other => Err(format!("'{other}' is not one of: http, candle, synthetic")),
+        }
+    }
+}
+
 /// Runtime configuration settings for the Zero-Trust Agentic Sidecar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -39,12 +63,12 @@ pub struct Config {
     pub jwt_secret: String,
     /// Path to the zero-trust TOML policy file
     pub policy_path: PathBuf,
-    /// Hugging Face repo ID for Kev adapter
-    pub kev_repo_id: String,
-    /// Hugging Face repo ID for Qwen base model
-    pub kev_base_repo_id: String,
-    /// Local directory for downloaded model artifacts
-    pub model_cache_dir: PathBuf,
+    /// Decision engine (`KEV_ENGINE`: http | candle | synthetic)
+    pub kev_engine: KevEngineKind,
+    /// Kev reference server base URL for the http engine (`KEV_URL`)
+    pub kev_url: String,
+    /// Kev checkpoint name in `models.json` (`KEV_MODEL`), e.g. `kev-4b`
+    pub kev_model: String,
 }
 
 impl Config {
@@ -102,20 +126,28 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("policy.toml"));
 
-        let kev_repo_id = env_map
-            .get("KEV_REPO_ID")
-            .cloned()
-            .unwrap_or_else(|| "jaredpalmer/kev-0.8b".to_string());
+        let kev_engine = match env_map.get("KEV_ENGINE") {
+            Some(value) => {
+                value
+                    .parse::<KevEngineKind>()
+                    .map_err(|reason| ConfigError::InvalidValue {
+                        var: "KEV_ENGINE",
+                        reason,
+                    })?
+            }
+            None => KevEngineKind::Http,
+        };
 
-        let kev_base_repo_id = env_map
-            .get("KEV_BASE_REPO_ID")
+        let kev_url = env_map
+            .get("KEV_URL")
             .cloned()
-            .unwrap_or_else(|| "Qwen/Qwen3.5-0.8B-Base".to_string());
+            .unwrap_or_else(|| "http://127.0.0.1:8008".to_string());
 
-        let model_cache_dir = env_map
-            .get("MODEL_CACHE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("models"));
+        let kev_model = env_map
+            .get("KEV_MODEL")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "kev-4b".to_string());
 
         Ok(Self {
             sidecar_addr,
@@ -125,9 +157,9 @@ impl Config {
             sidecar_secret,
             jwt_secret,
             policy_path,
-            kev_repo_id,
-            kev_base_repo_id,
-            model_cache_dir,
+            kev_engine,
+            kev_url,
+            kev_model,
         })
     }
 
@@ -141,9 +173,9 @@ impl Config {
             sidecar_secret: sidecar_secret.to_string(),
             jwt_secret: jwt_secret.to_string(),
             policy_path: PathBuf::from("policy.toml"),
-            kev_repo_id: "jaredpalmer/kev-0.8b".to_string(),
-            kev_base_repo_id: "Qwen/Qwen3.5-0.8B-Base".to_string(),
-            model_cache_dir: PathBuf::from("models"),
+            kev_engine: KevEngineKind::Synthetic,
+            kev_url: "http://127.0.0.1:8008".to_string(),
+            kev_model: "kev-4b".to_string(),
         }
     }
 
@@ -176,9 +208,9 @@ mod tests {
         );
         assert_eq!(config.flask_backend_url, "http://127.0.0.1:5000");
         assert_eq!(config.policy_path, PathBuf::from("policy.toml"));
-        assert_eq!(config.kev_repo_id, "jaredpalmer/kev-0.8b");
-        assert_eq!(config.kev_base_repo_id, "Qwen/Qwen3.5-0.8B-Base");
-        assert_eq!(config.model_cache_dir, PathBuf::from("models"));
+        assert_eq!(config.kev_engine, KevEngineKind::Synthetic);
+        assert_eq!(config.kev_url, "http://127.0.0.1:8008");
+        assert_eq!(config.kev_model, "kev-4b");
     }
 
     #[test]
@@ -191,9 +223,9 @@ mod tests {
             ("UPSTREAM_LLM_URL", "https://custom.llm.example/v1/messages"),
             ("FLASK_BACKEND_URL", "http://backend.internal:5000"),
             ("POLICY_PATH", "custom_policy.toml"),
-            ("KEV_REPO_ID", "custom/kev-model"),
-            ("KEV_BASE_REPO_ID", "custom/base-model"),
-            ("MODEL_CACHE_DIR", "/custom/cache"),
+            ("KEV_ENGINE", "Candle"),
+            ("KEV_URL", "http://127.0.0.1:9008"),
+            ("KEV_MODEL", "kev-0.8b"),
         ];
 
         let config = Config::from_vars(vars).expect("Config should parse successfully");
@@ -207,9 +239,9 @@ mod tests {
         );
         assert_eq!(config.flask_backend_url, "http://backend.internal:5000");
         assert_eq!(config.policy_path, PathBuf::from("custom_policy.toml"));
-        assert_eq!(config.kev_repo_id, "custom/kev-model");
-        assert_eq!(config.kev_base_repo_id, "custom/base-model");
-        assert_eq!(config.model_cache_dir, PathBuf::from("/custom/cache"));
+        assert_eq!(config.kev_engine, KevEngineKind::Candle);
+        assert_eq!(config.kev_url, "http://127.0.0.1:9008");
+        assert_eq!(config.kev_model, "kev-0.8b");
     }
 
     #[test]
@@ -228,9 +260,22 @@ mod tests {
         );
         assert_eq!(config.flask_backend_url, "http://127.0.0.1:5000");
         assert_eq!(config.policy_path, PathBuf::from("policy.toml"));
-        assert_eq!(config.kev_repo_id, "jaredpalmer/kev-0.8b");
-        assert_eq!(config.kev_base_repo_id, "Qwen/Qwen3.5-0.8B-Base");
-        assert_eq!(config.model_cache_dir, PathBuf::from("models"));
+        assert_eq!(config.kev_engine, KevEngineKind::Http);
+        assert_eq!(config.kev_url, "http://127.0.0.1:8008");
+        assert_eq!(config.kev_model, "kev-4b");
+    }
+
+    #[test]
+    fn test_config_invalid_kev_engine_fails() {
+        let vars = [
+            ("SIDECAR_SECRET", "secret-1"),
+            ("JWT_SECRET", "secret-2"),
+            ("KEV_ENGINE", "onnx"),
+        ];
+        match Config::from_vars(vars).unwrap_err() {
+            ConfigError::InvalidValue { var, .. } => assert_eq!(var, "KEV_ENGINE"),
+            other => panic!("Expected InvalidValue, got {:?}", other),
+        }
     }
 
     #[test]
