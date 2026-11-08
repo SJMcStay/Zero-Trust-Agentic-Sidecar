@@ -1,0 +1,50 @@
+[package]
+name = "zero-trust-agentic-sidecar"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Deterministic Zero-Trust Execution Proxy for AI Agents"
+authors = ["Zero-Trust Sidecar Team"]
+
+[lib]
+name = "zero_trust_agentic_sidecar"
+path = "src/lib.rs"
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["macros"] }
+base64 = "0.22"
+bytes = "1.6"
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+hex = "0.4"
+hf-hub = "0.3"
+hmac = "0.12"
+jsonwebtoken = "9.3"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+safetensors = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "1.0"
+tokenizers = { version = "0.19", default-features = false, features = ["onig"] }
+tokio = { version = "1.38", features = ["full"] }
+toml = "0.8"
+tower = { version = "0.4", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

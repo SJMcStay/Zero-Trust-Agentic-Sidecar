@@ -77,16 +77,12 @@ CLAUDE.local.md
 *.original.md
 
 # ---------------------------------------------------------------------
-# Google Antigravity / Gemini CLI
-#   SHARED (commit):  AGENTS.md, GEMINI.md, .agent/rules/,
-#                     .agent/workflows/, .gemini/settings.json
-#   PERSONAL (ignore): below
+# Google Antigravity / Gemini CLI / Agentic Workflows
 # ---------------------------------------------------------------------
-.gemini/.env
-.gemini/tmp/
-.gemini/*.local.*
-.gemini/settings.local.json
-.agent/*.local.*
+.agents/
+.agent/
+.claude/
+.gemini/
 .antigravity/
 .antigravity-server/
 
@@ -127,3 +123,8 @@ Desktop.ini
 /tmp/
 /scratch/
 *.tmp
+.agents/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

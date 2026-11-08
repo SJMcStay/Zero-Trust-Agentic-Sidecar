@@ -1,0 +1,30 @@
+[defaults]
+max_injection_confidence = 0.70
+max_malicious_intent = 0.50
+model_timeout_ms = 500
+fail_closed = true
+require_jwt = true
+
+[endpoints."/api/v1/system/status"]
+backend_url = "http://127.0.0.1:5000/api/v1/system/status"
+enabled = true
+allowed_methods = ["GET", "POST"]
+allowed_roles = ["agent", "admin", "readonly"]
+required_args = ["service"]
+constraints.service = { regex = "^[a-z0-9-]+$", max_len = 64 }
+
+[endpoints."/api/v1/email/send"]
+backend_url = "http://127.0.0.1:5000/api/v1/email/send"
+enabled = true
+allowed_methods = ["POST"]
+allowed_roles = ["agent", "admin"]
+required_args = ["to", "body"]
+constraints.to = { regex = "^[^@]+@ourcompany\\.com$", max_len = 128 }
+constraints.body = { max_len = 2000 }
+
+[endpoints."/api/v1/db/drop"]
+backend_url = "http://127.0.0.1:5000/api/v1/db/drop"
+enabled = false
+allowed_methods = ["POST"]
+allowed_roles = []
+required_args = ["table"]
